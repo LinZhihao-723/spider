@@ -42,6 +42,8 @@ mod types;
 
 pub use factory::*;
 pub use job::{JobControlBlock, ReadyQueueConnector, TaskInstancePoolConnector};
+pub use task::{SharedTaskControlBlock, SharedTerminationTaskControlBlock};
+pub use types::{ExecutionContext, TaskId};
 
 #[cfg(test)]
 #[allow(
