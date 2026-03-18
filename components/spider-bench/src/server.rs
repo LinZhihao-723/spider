@@ -17,7 +17,7 @@ use spider_storage::cache::{
     build_job,
     error::InternalError,
 };
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::Mutex;
 use tonic::{Request, Response, Status, transport::Server};
 
 use spider_bench::{
@@ -54,17 +54,22 @@ struct Cli {
 
     #[arg(long, default_value_t = 10)]
     neural_net_fan_in: usize,
+
+    /// Number of workers expected. Must match the client's --num-workers.
+    /// Used to create per-worker dispatch channels.
+    #[arg(long, default_value_t = 128)]
+    num_workers: usize,
 }
 
 // =============================================================================
-// Server ready queue — feeds task indices into an mpsc channel
+// Server ready queue — round-robin dispatches to per-worker channels
 // =============================================================================
 
 type Jcb = spider_storage::cache::JobControlBlock<ServerReadyQueue, MockDb, MockInstancePool>;
 
 struct ServerReadyQueue {
-    tx: mpsc::UnboundedSender<TaskIndex>,
-    ready_count: AtomicU64,
+    worker_txs: Vec<tokio::sync::mpsc::UnboundedSender<TaskIndex>>,
+    round_robin: AtomicU64,
 }
 
 #[async_trait]
@@ -74,10 +79,11 @@ impl ReadyQueueConnector for ServerReadyQueue {
         _job_id: JobId,
         task_ids: Vec<TaskIndex>,
     ) -> Result<(), InternalError> {
-        self.ready_count
-            .fetch_add(task_ids.len() as u64, Ordering::Relaxed);
+        let num_workers = self.worker_txs.len();
         for idx in task_ids {
-            let _ = self.tx.send(idx);
+            let worker =
+                self.round_robin.fetch_add(1, Ordering::Relaxed) as usize % num_workers;
+            let _ = self.worker_txs[worker].send(idx);
         }
         Ok(())
     }
@@ -95,17 +101,86 @@ impl ReadyQueueConnector for ServerReadyQueue {
 // gRPC service implementation
 // =============================================================================
 
+/// Server-side latency collector for RPC handlers.
+struct ServerStats {
+    register_durations: Mutex<Vec<std::time::Duration>>,
+    submit_durations: Mutex<Vec<std::time::Duration>>,
+}
+
+impl ServerStats {
+    fn new() -> Self {
+        Self {
+            register_durations: Mutex::new(Vec::new()),
+            submit_durations: Mutex::new(Vec::new()),
+        }
+    }
+
+    async fn report(&self) {
+        let to_ms = |d: &std::time::Duration| d.as_secs_f64() * 1000.0;
+
+        let register = self.register_durations.lock().await;
+        let submit = self.submit_durations.lock().await;
+
+        let mut register_ms: Vec<f64> = register.iter().map(to_ms).collect();
+        let mut submit_ms: Vec<f64> = submit.iter().map(to_ms).collect();
+        register_ms.sort_by(|a, b| a.partial_cmp(b).expect("should be comparable"));
+        submit_ms.sort_by(|a, b| a.partial_cmp(b).expect("should be comparable"));
+
+        eprintln!();
+        eprintln!("=== Server-side RPC latencies ===");
+        eprintln!("  --- RegisterTaskInstance (server) ---");
+        eprintln!("    count:                       {:>10}", register_ms.len());
+        eprintln!(
+            "    avg:                         {:>10.3} ms",
+            spider_bench::avg_of(&register_ms)
+        );
+        eprintln!(
+            "    p50:                         {:>10.3} ms",
+            spider_bench::percentile(&register_ms, 50.0)
+        );
+        eprintln!(
+            "    p95:                         {:>10.3} ms",
+            spider_bench::percentile(&register_ms, 95.0)
+        );
+        eprintln!(
+            "    p99:                         {:>10.3} ms",
+            spider_bench::percentile(&register_ms, 99.0)
+        );
+        eprintln!("  --- SubmitTaskResult (server) ---");
+        eprintln!("    count:                       {:>10}", submit_ms.len());
+        eprintln!(
+            "    avg:                         {:>10.3} ms",
+            spider_bench::avg_of(&submit_ms)
+        );
+        eprintln!(
+            "    p50:                         {:>10.3} ms",
+            spider_bench::percentile(&submit_ms, 50.0)
+        );
+        eprintln!(
+            "    p95:                         {:>10.3} ms",
+            spider_bench::percentile(&submit_ms, 95.0)
+        );
+        eprintln!(
+            "    p99:                         {:>10.3} ms",
+            spider_bench::percentile(&submit_ms, 99.0)
+        );
+        eprintln!();
+    }
+}
+
 struct BenchService {
     jcb: Arc<Jcb>,
-    rx: Arc<Mutex<mpsc::UnboundedReceiver<TaskIndex>>>,
+    /// Per-worker receive channels. Indexed by `worker_id` from the request.
+    worker_rxs: Vec<Mutex<tokio::sync::mpsc::UnboundedReceiver<TaskIndex>>>,
     done: Arc<AtomicBool>,
+    stats: Arc<ServerStats>,
 }
 
 #[tonic::async_trait]
 impl BenchScheduler for BenchService {
     async fn get_ready_task(
         &self,
-        _request: Request<proto::GetReadyTaskRequest>,
+        request: Request<proto::GetReadyTaskRequest>,
     ) -> Result<Response<proto::GetReadyTaskResponse>, Status> {
         if self.done.load(Ordering::Relaxed) {
             return Ok(Response::new(proto::GetReadyTaskResponse {
@@ -114,23 +189,25 @@ impl BenchScheduler for BenchService {
             }));
         }
 
-        // Use try_recv to avoid holding the mutex across an await point, which would
-        // serialize all GetReadyTask calls.
-        let result = self.rx.lock().await.try_recv();
+        let worker_id = request.into_inner().worker_id as usize;
+        if worker_id >= self.worker_rxs.len() {
+            return Err(Status::invalid_argument(format!(
+                "worker_id {worker_id} out of range (max {})",
+                self.worker_rxs.len() - 1
+            )));
+        }
+
+        // Each worker has its own channel — no contention with other workers.
+        let result = self.worker_rxs[worker_id].lock().await.try_recv();
         match result {
             Ok(task_index) => Ok(Response::new(proto::GetReadyTaskResponse {
                 has_task: true,
                 task_index: task_index as u64,
             })),
-            Err(_) => {
-                // No task available right now. Return has_task=false so the client retries.
-                // This is NOT the same as "job is done" — the client distinguishes by checking
-                // the done state from SubmitTaskResult responses.
-                Ok(Response::new(proto::GetReadyTaskResponse {
-                    has_task: false,
-                    task_index: 0,
-                }))
-            }
+            Err(_) => Ok(Response::new(proto::GetReadyTaskResponse {
+                has_task: false,
+                task_index: 0,
+            })),
         }
     }
 
@@ -138,6 +215,8 @@ impl BenchScheduler for BenchService {
         &self,
         request: Request<proto::RegisterTaskInstanceRequest>,
     ) -> Result<Response<proto::RegisterTaskInstanceResponse>, Status> {
+        let start = std::time::Instant::now();
+
         let req = request.into_inner();
         let task_index = req.task_index as usize;
 
@@ -150,6 +229,8 @@ impl BenchScheduler for BenchService {
         let inputs_bytes = rmp_serde::to_vec(&ctx.inputs)
             .map_err(|e| Status::internal(format!("failed to serialize inputs: {e}")))?;
 
+        self.stats.register_durations.lock().await.push(start.elapsed());
+
         Ok(Response::new(proto::RegisterTaskInstanceResponse {
             task_instance_id: ctx.task_instance_id,
             inputs: inputs_bytes,
@@ -160,6 +241,8 @@ impl BenchScheduler for BenchService {
         &self,
         request: Request<proto::SubmitTaskResultRequest>,
     ) -> Result<Response<proto::SubmitTaskResultResponse>, Status> {
+        let start = std::time::Instant::now();
+
         let req = request.into_inner();
         let task_index = req.task_index as usize;
 
@@ -180,6 +263,8 @@ impl BenchScheduler for BenchService {
                 .await
                 .map_err(|e| Status::internal(format!("fail_task_instance failed: {e:?}")))?
         };
+
+        self.stats.submit_durations.lock().await.push(start.elapsed());
 
         if state.is_terminal() {
             self.done.store(true, Ordering::Relaxed);
@@ -222,11 +307,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli.benchmark
     );
 
-    // Create the ready queue channel.
-    let (tx, rx) = mpsc::unbounded_channel::<TaskIndex>();
+    // Create per-worker channels.
+    let num_workers = cli.num_workers;
+    let mut worker_txs = Vec::with_capacity(num_workers);
+    let mut worker_rxs = Vec::with_capacity(num_workers);
+    for _ in 0..num_workers {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<TaskIndex>();
+        worker_txs.push(tx);
+        worker_rxs.push(Mutex::new(rx));
+    }
+
     let ready_queue = ServerReadyQueue {
-        tx: tx.clone(),
-        ready_count: AtomicU64::new(0),
+        worker_txs: worker_txs.clone(),
+        round_robin: AtomicU64::new(0),
     };
 
     // Build the job.
@@ -243,31 +336,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("Job built: {} initially ready tasks", initial_ready.len());
 
-    // Seed initial ready tasks.
-    for &idx in &initial_ready {
-        tx.send(idx).expect("channel should be open");
+    // Seed initial ready tasks round-robin across worker channels.
+    for (i, &idx) in initial_ready.iter().enumerate() {
+        worker_txs[i % num_workers]
+            .send(idx)
+            .expect("channel should be open during seeding");
     }
 
     let done = Arc::new(AtomicBool::new(false));
+    let stats = Arc::new(ServerStats::new());
 
     let service = BenchService {
         jcb: Arc::new(jcb),
-        rx: Arc::new(Mutex::new(rx)),
+        worker_rxs,
         done: done.clone(),
+        stats: Arc::clone(&stats),
     };
 
     let addr = format!("[::1]:{}", cli.port).parse()?;
-    eprintln!("Server listening on {addr}");
+    eprintln!("Server listening on {addr} ({num_workers} worker channels)");
 
-    // Run server until the job completes.
     Server::builder()
         .add_service(BenchSchedulerServer::new(service))
         .serve_with_shutdown(addr, async move {
-            // Poll until done.
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 if done.load(Ordering::Relaxed) {
-                    // Grace period for in-flight RPCs.
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     break;
                 }
@@ -275,6 +369,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .await?;
 
+    stats.report().await;
     eprintln!("Server shutting down.");
     Ok(())
 }

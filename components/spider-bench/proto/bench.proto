@@ -12,7 +12,10 @@ service BenchScheduler {
   rpc SubmitTaskResult(SubmitTaskResultRequest) returns (SubmitTaskResultResponse);
 }
 
-message GetReadyTaskRequest {}
+message GetReadyTaskRequest {
+  // Worker identity — used to route to a per-worker queue.
+  uint32 worker_id = 1;
+}
 
 message GetReadyTaskResponse {
   bool has_task = 1;

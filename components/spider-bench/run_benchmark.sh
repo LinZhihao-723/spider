@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 PORT=50051
-NUM_WORKERS=16
+NUM_WORKERS=32
 
 # Ensure protoc is available for building.
 if ! command -v protoc &>/dev/null; then
@@ -33,7 +33,7 @@ run_benchmark() {
     echo "============================================================"
 
     # Start server in background.
-    "$SERVER_BIN" --benchmark "$bench_name" --port "$PORT" "$@" &
+    "$SERVER_BIN" --benchmark "$bench_name" --port "$PORT" --num-workers "$NUM_WORKERS" "$@" &
     SERVER_PID=$!
 
     # Wait for server to be ready.

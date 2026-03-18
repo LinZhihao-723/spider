@@ -46,14 +46,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let exec_start = Instant::now();
 
     let mut handles = Vec::with_capacity(cli.num_workers);
-    for _ in 0..cli.num_workers {
+    for worker_id in 0..cli.num_workers {
         let client = BenchSchedulerClient::new(channel.clone());
         let latencies = Arc::clone(&latencies);
         let done_tx = Arc::clone(&done_tx);
         let mut done_rx = done_rx.clone();
 
         handles.push(tokio::spawn(async move {
-            worker_loop(client, latencies, &done_tx, &mut done_rx).await;
+            worker_loop(worker_id as u32, client, latencies, &done_tx, &mut done_rx).await;
         }));
     }
 
@@ -78,24 +78,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn worker_loop(
+    worker_id: u32,
     mut client: BenchSchedulerClient<tonic::transport::Channel>,
     latencies: Arc<Mutex<Vec<TaskLatency>>>,
     done_tx: &tokio::sync::watch::Sender<bool>,
     done_rx: &mut tokio::sync::watch::Receiver<bool>,
 ) {
     loop {
-        // Check if another worker already signalled completion.
         if *done_rx.borrow() {
             break;
         }
 
-        // Step 1: Get a ready task. Retry if the queue is temporarily empty.
+        // Step 1: Get a ready task from this worker's dedicated queue.
         let task_index = loop {
             if *done_rx.borrow() {
                 return;
             }
             let ready_resp = client
-                .get_ready_task(GetReadyTaskRequest {})
+                .get_ready_task(GetReadyTaskRequest { worker_id })
                 .await
                 .expect("GetReadyTask RPC should succeed")
                 .into_inner();
