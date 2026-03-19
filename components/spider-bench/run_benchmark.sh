@@ -34,7 +34,7 @@ run_benchmark() {
         exit 1
     fi
 
-    "$CLIENT_BIN" --server-addr "http://[::1]:$PORT" --num-workers "$NUM_WORKERS" \
+    "$CLIENT_BIN" --server-addr "http://127.0.0.1:$PORT" --num-workers "$NUM_WORKERS" \
         --compression "$compression" --input-size "$input_size"
 
     wait "$SERVER_PID" 2>/dev/null || true

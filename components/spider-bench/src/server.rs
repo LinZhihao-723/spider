@@ -389,7 +389,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/submit_task_result", post(handle_submit_task_result))
         .with_state(app_state);
 
-    let addr = format!("[::1]:{}", cli.port);
+    let addr = format!("0.0.0.0:{}", cli.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     eprintln!("Server listening on {addr} ({num_workers} worker channels)");
 

@@ -48,6 +48,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli.server_addr, cli.compression
     );
 
+    // Wait for the server to be reachable before spawning workers.
+    wait_for_server(&http_client, &cli.server_addr).await;
+    eprintln!("Server is ready.");
+
     let latencies: Arc<Mutex<Vec<TaskLatency>>> = Arc::new(Mutex::new(Vec::new()));
     let (done_tx, done_rx) = tokio::sync::watch::channel(false);
     let done_tx = Arc::new(done_tx);
@@ -100,6 +104,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Polls the server until it responds, retrying with backoff. Gives up after 60 seconds.
+async fn wait_for_server(http_client: &reqwest::Client, base_url: &str) {
+    let url = format!("{base_url}/get_ready_task");
+    let deadline = Instant::now() + std::time::Duration::from_secs(60);
+
+    loop {
+        match http_client
+            .post(&url)
+            .json(&GetReadyTaskRequest { worker_id: 0 })
+            .send()
+            .await
+        {
+            Ok(_) => return,
+            Err(e) => {
+                if Instant::now() > deadline {
+                    panic!("Server at {base_url} not reachable after 60s: {e}");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
+    }
+}
+
 async fn worker_loop(
     worker_id: u32,
     http_client: &reqwest::Client,
@@ -119,25 +146,36 @@ async fn worker_loop(
             break;
         }
 
-        // Step 1: Get a ready task (JSON — tiny payload).
+        // Step 1: Get a ready task. Retry on connection errors and empty queue.
         let task_index = loop {
             if *done_rx.borrow() {
                 return;
             }
-            let resp: GetReadyTaskResponse = http_client
+            let result = http_client
                 .post(&get_ready_url)
                 .json(&GetReadyTaskRequest { worker_id })
                 .send()
-                .await
-                .expect("GetReadyTask request should succeed")
-                .json()
-                .await
-                .expect("GetReadyTask response should deserialize");
+                .await;
 
-            if resp.has_task {
-                break resp.task_index;
+            match result {
+                Ok(resp) => {
+                    let ready: GetReadyTaskResponse = resp
+                        .json()
+                        .await
+                        .expect("GetReadyTask response should deserialize");
+                    if ready.has_task {
+                        break ready.task_index;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                Err(e) if e.is_connect() || e.is_timeout() => {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                Err(e) => {
+                    eprintln!("GetReadyTask error (worker {worker_id}): {e}");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
             }
-            tokio::task::yield_now().await;
         };
 
         // Step 2: Register task instance (timed).
