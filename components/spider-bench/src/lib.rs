@@ -174,10 +174,10 @@ pub fn make_1kb_payload() -> Vec<u8> {
     vec![0xab_u8; 1024]
 }
 
-/// Generate a 1KB payload filled with random bytes (incompressible data).
-pub fn make_random_1kb_payload() -> Vec<u8> {
+/// Generate a payload of `size` bytes filled with random data.
+pub fn make_random_payload(size: usize) -> Vec<u8> {
     let mut rng = rand::thread_rng();
-    let mut buf = vec![0u8; 128];
+    let mut buf = vec![0u8; size];
     rng.fill(buf.as_mut_slice());
     buf
 }
@@ -186,6 +186,7 @@ pub fn build_flat_graph(
     num_tasks: usize,
     num_inputs_per_task: usize,
     num_outputs_per_task: usize,
+    input_size: usize,
     compression: Compression,
 ) -> (CoreTaskGraph, Vec<TaskInput>) {
     let mut graph = CoreTaskGraph::default();
@@ -203,7 +204,7 @@ pub fn build_flat_graph(
     }
     // Job inputs are pre-compressed so the cache stores compressed bytes directly.
     let job_inputs: Vec<TaskInput> = (0..num_tasks * num_inputs_per_task)
-        .map(|_| TaskInput::ValuePayload(compress_bytes(&make_random_1kb_payload(), compression)))
+        .map(|_| TaskInput::ValuePayload(compress_bytes(&make_random_payload(input_size), compression)))
         .collect();
     (graph, job_inputs)
 }
@@ -212,6 +213,7 @@ pub fn build_neural_net_graph(
     num_layers: usize,
     width: usize,
     fan_in: usize,
+    input_size: usize,
     compression: Compression,
 ) -> (CoreTaskGraph, Vec<TaskInput>, Vec<Vec<TaskIndex>>) {
     let mut graph = CoreTaskGraph::default();
@@ -266,7 +268,7 @@ pub fn build_neural_net_graph(
 
     // Job inputs are pre-compressed so the cache stores compressed bytes directly.
     let job_inputs: Vec<TaskInput> = (0..width * fan_in)
-        .map(|_| TaskInput::ValuePayload(compress_bytes(&make_random_1kb_payload(), compression)))
+        .map(|_| TaskInput::ValuePayload(compress_bytes(&make_random_payload(input_size), compression)))
         .collect();
 
     (graph, job_inputs, layers)

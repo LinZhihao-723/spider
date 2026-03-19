@@ -10,7 +10,7 @@ use spider_bench::{
     SubmitTaskResultRequest, SubmitTaskResultResponse,
     TaskLatency,
     compress_bytes, hex_encode,
-    job_state_is_terminal, make_random_1kb_payload, report_stats,
+    job_state_is_terminal, make_random_payload, report_stats,
 };
 
 // =============================================================================
@@ -28,6 +28,10 @@ struct Cli {
 
     #[arg(long, value_enum, default_value_t = Compression::None)]
     compression: Compression,
+
+    /// Size of each output payload in bytes.
+    #[arg(long, default_value_t = 1024)]
+    input_size: usize,
 }
 
 // =============================================================================
@@ -59,6 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let done_tx = Arc::clone(&done_tx);
         let mut done_rx = done_rx.clone();
         let compression = cli.compression;
+        let input_size = cli.input_size;
 
         handles.push(tokio::spawn(async move {
             worker_loop(
@@ -66,6 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &http_client,
                 &base_url,
                 compression,
+                input_size,
                 latencies,
                 &done_tx,
                 &mut done_rx,
@@ -100,6 +106,7 @@ async fn worker_loop(
     http_client: &reqwest::Client,
     base_url: &str,
     compression: Compression,
+    input_size: usize,
     latencies: Arc<Mutex<Vec<TaskLatency>>>,
     done_tx: &tokio::sync::watch::Sender<bool>,
     done_rx: &mut tokio::sync::watch::Receiver<bool>,
@@ -153,7 +160,7 @@ async fn worker_loop(
 
         // Step 3: Produce randomized 1KB output, compress it (outside timing).
         // The compressed bytes are what the server stores in the cache.
-        let raw_output = make_random_1kb_payload();
+        let raw_output = make_random_payload(input_size);
         let compressed_output = compress_bytes(&raw_output, compression);
         let outputs: Vec<Vec<u8>> = vec![compressed_output];
         let outputs_bytes =

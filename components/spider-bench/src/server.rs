@@ -68,6 +68,10 @@ struct Cli {
 
     #[arg(long, value_enum, default_value_t = Compression::None)]
     compression: Compression,
+
+    /// Size of each input/output payload in bytes.
+    #[arg(long, default_value_t = 1024)]
+    input_size: usize,
 }
 
 // =============================================================================
@@ -284,12 +288,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     let (graph, job_inputs) = match cli.benchmark.as_str() {
-        "flat" => build_flat_graph(cli.num_tasks, 2, 1, cli.compression),
+        "flat" => build_flat_graph(cli.num_tasks, 2, 1, cli.input_size, cli.compression),
         "neural-net" => {
             let (g, inputs, _layers) = build_neural_net_graph(
                 cli.neural_net_layers,
                 cli.neural_net_width,
                 cli.neural_net_fan_in,
+                cli.input_size,
                 cli.compression,
             );
             (g, inputs)

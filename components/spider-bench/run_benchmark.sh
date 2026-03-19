@@ -16,15 +16,16 @@ CLIENT_BIN="$WORKSPACE_ROOT/target/release/worker-client"
 run_benchmark() {
     local bench_name=$1
     local compression=$2
-    shift 2
+    local input_size=$3
+    shift 3
 
     echo ""
     echo "============================================================"
-    echo "  Benchmark: $bench_name (compression=$compression)"
+    echo "  Benchmark: $bench_name (compression=$compression, input_size=$input_size)"
     echo "============================================================"
 
     "$SERVER_BIN" --benchmark "$bench_name" --port "$PORT" --num-workers "$NUM_WORKERS" \
-        --compression "$compression" "$@" &
+        --compression "$compression" --input-size "$input_size" "$@" &
     SERVER_PID=$!
 
     sleep 2
@@ -34,15 +35,15 @@ run_benchmark() {
     fi
 
     "$CLIENT_BIN" --server-addr "http://[::1]:$PORT" --num-workers "$NUM_WORKERS" \
-        --compression "$compression"
+        --compression "$compression" --input-size "$input_size"
 
     wait "$SERVER_PID" 2>/dev/null || true
 }
 
 for compression in none zstd; do
-    run_benchmark flat "$compression" --num-tasks 10000
+    run_benchmark flat "$compression" 1024 --num-tasks 10000
 
-    run_benchmark neural-net "$compression" \
+    run_benchmark neural-net "$compression" 128 \
         --neural-net-layers 10 \
         --neural-net-width 1000 \
         --neural-net-fan-in 25
