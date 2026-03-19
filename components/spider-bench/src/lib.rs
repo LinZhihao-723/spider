@@ -43,27 +43,20 @@ pub struct RegisterTaskInstanceRequest {
     pub task_index: u64,
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct RegisterTaskInstanceResponse {
-    pub task_instance_id: u64,
-    /// rmp_serde-serialized `Option<Vec<TaskInput>>`, base64-encoded.
-    pub inputs_b64: String,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct SubmitTaskResultRequest {
-    pub task_instance_id: u64,
-    pub task_index: u64,
-    pub success: bool,
-    /// rmp_serde-serialized `Vec<TaskOutput>`, base64-encoded (valid when success == true).
-    pub outputs_b64: String,
-    pub error_message: String,
-}
+/// Response for RegisterTaskInstance is raw binary (rmp_serde bytes of inputs) with metadata
+/// in headers: `X-Task-Instance-Id`.
+/// (No JSON struct needed for the response body.)
 
 #[derive(Serialize, Deserialize)]
 pub struct SubmitTaskResultResponse {
     pub job_state: String,
 }
+
+/// Headers used for binary transport.
+pub const HEADER_TASK_INSTANCE_ID: &str = "x-task-instance-id";
+pub const HEADER_TASK_INDEX: &str = "x-task-index";
+pub const HEADER_SUCCESS: &str = "x-success";
+pub const HEADER_ERROR_MESSAGE: &str = "x-error-message";
 
 // =============================================================================
 // Job state helpers
@@ -129,38 +122,6 @@ pub fn decompress_bytes(data: &[u8], compression: Compression) -> Vec<u8> {
     }
 }
 
-/// Hex-encode bytes for JSON transport (no compression — just encoding).
-pub fn hex_encode(data: &[u8]) -> String {
-    use std::io::Write;
-    let mut buf = Vec::with_capacity(data.len() * 2);
-    for byte in data {
-        write!(buf, "{byte:02x}").expect("hex encoding should not fail");
-    }
-    String::from_utf8(buf).expect("hex is valid utf8")
-}
-
-/// Hex-decode bytes from JSON transport (no decompression — just decoding).
-pub fn hex_decode(s: &str) -> Vec<u8> {
-    let mut result = Vec::with_capacity(s.len() / 2);
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i + 1 < bytes.len() {
-        let hi = hex_val(bytes[i]);
-        let lo = hex_val(bytes[i + 1]);
-        result.push((hi << 4) | lo);
-        i += 2;
-    }
-    result
-}
-
-fn hex_val(b: u8) -> u8 {
-    match b {
-        b'0'..=b'9' => b - b'0',
-        b'a'..=b'f' => b - b'a' + 10,
-        b'A'..=b'F' => b - b'A' + 10,
-        _ => 0,
-    }
-}
 
 // =============================================================================
 // Graph builders (ported from spider-storage tests)

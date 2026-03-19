@@ -7,7 +7,10 @@ use std::time::Instant;
 use async_trait::async_trait;
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::State,
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
     routing::post,
 };
 use clap::Parser;
@@ -28,12 +31,12 @@ use tokio::sync::Mutex;
 use spider_bench::{
     Compression,
     GetReadyTaskRequest, GetReadyTaskResponse,
+    HEADER_ERROR_MESSAGE, HEADER_SUCCESS, HEADER_TASK_INDEX, HEADER_TASK_INSTANCE_ID,
     MockDb, MockInstancePool,
-    RegisterTaskInstanceRequest, RegisterTaskInstanceResponse,
-    SubmitTaskResultRequest, SubmitTaskResultResponse,
+    RegisterTaskInstanceRequest,
+    SubmitTaskResultResponse,
     avg_of,
     build_flat_graph, build_neural_net_graph,
-    hex_decode, hex_encode,
     job_state_to_string,
     percentile,
 };
@@ -69,13 +72,12 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = Compression::None)]
     compression: Compression,
 
-    /// Size of each input/output payload in bytes.
     #[arg(long, default_value_t = 1024)]
     input_size: usize,
 }
 
 // =============================================================================
-// Server ready queue — round-robin dispatches to per-worker channels
+// Server ready queue
 // =============================================================================
 
 type Jcb = spider_storage::cache::JobControlBlock<ServerReadyQueue, MockDb, MockInstancePool>;
@@ -157,7 +159,7 @@ impl ServerStats {
 }
 
 // =============================================================================
-// Shared app state
+// App state
 // =============================================================================
 
 struct AppState {
@@ -203,10 +205,11 @@ async fn handle_get_ready_task(
     }
 }
 
+/// Returns raw binary body (rmp_serde bytes of inputs) with task_instance_id in a header.
 async fn handle_register_task_instance(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RegisterTaskInstanceRequest>,
-) -> Json<RegisterTaskInstanceResponse> {
+) -> impl IntoResponse {
     let start = Instant::now();
 
     let task_index = req.task_index as usize;
@@ -216,7 +219,6 @@ async fn handle_register_task_instance(
         .await
         .expect("create_task_instance should succeed");
 
-    // Time only the cache-layer call, not the serialization for transport.
     state
         .stats
         .register_durations
@@ -227,37 +229,64 @@ async fn handle_register_task_instance(
     let inputs_bytes =
         rmp_serde::to_vec(&ctx.inputs).expect("input serialization should succeed");
 
-    Json(RegisterTaskInstanceResponse {
-        task_instance_id: ctx.task_instance_id,
-        inputs_b64: hex_encode(&inputs_bytes),
-    })
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        HEADER_TASK_INSTANCE_ID,
+        ctx.task_instance_id.to_string().parse().expect("u64 should be a valid header value"),
+    );
+
+    (StatusCode::OK, headers, inputs_bytes)
 }
 
+/// Accepts raw binary body (rmp_serde bytes of outputs) with metadata in headers.
 async fn handle_submit_task_result(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<SubmitTaskResultRequest>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Json<SubmitTaskResultResponse> {
     let start = Instant::now();
 
-    let task_index = req.task_index as usize;
+    let task_instance_id: u64 = headers
+        .get(HEADER_TASK_INSTANCE_ID)
+        .expect("missing x-task-instance-id header")
+        .to_str()
+        .expect("header should be valid str")
+        .parse()
+        .expect("header should be valid u64");
+    let task_index: usize = headers
+        .get(HEADER_TASK_INDEX)
+        .expect("missing x-task-index header")
+        .to_str()
+        .expect("header should be valid str")
+        .parse()
+        .expect("header should be valid usize");
+    let success: bool = headers
+        .get(HEADER_SUCCESS)
+        .expect("missing x-success header")
+        .to_str()
+        .expect("header should be valid str")
+        .parse()
+        .expect("header should be valid bool");
 
-    // Server receives bytes as-is (compressed if client uses compression).
-    let job_state = if req.success {
-        let outputs_bytes = hex_decode(&req.outputs_b64);
+    let job_state = if success {
         let outputs: Vec<TaskOutput> =
-            rmp_serde::from_slice(&outputs_bytes).expect("output deserialization should succeed");
+            rmp_serde::from_slice(&body).expect("output deserialization should succeed");
         state
             .jcb
-            .complete_task_instance(req.task_instance_id, task_index, outputs)
+            .complete_task_instance(task_instance_id, task_index, outputs)
             .await
             .expect("complete_task_instance should succeed")
     } else {
+        let error_message = headers
+            .get(HEADER_ERROR_MESSAGE)
+            .map(|v| v.to_str().unwrap_or("").to_owned())
+            .unwrap_or_default();
         state
             .jcb
             .fail_task_instance(
-                req.task_instance_id,
+                task_instance_id,
                 TaskId::TaskIndex(task_index),
-                req.error_message,
+                error_message,
             )
             .await
             .expect("fail_task_instance should succeed")
@@ -364,7 +393,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     eprintln!("Server listening on {addr} ({num_workers} worker channels)");
 
-    // Serve until the job completes.
     let done_for_shutdown = done.clone();
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {

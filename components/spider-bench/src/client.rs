@@ -6,11 +6,11 @@ use tokio::sync::Mutex;
 use spider_bench::{
     Compression,
     GetReadyTaskRequest, GetReadyTaskResponse,
-    RegisterTaskInstanceRequest, RegisterTaskInstanceResponse,
-    SubmitTaskResultRequest, SubmitTaskResultResponse,
+    HEADER_ERROR_MESSAGE, HEADER_SUCCESS, HEADER_TASK_INDEX, HEADER_TASK_INSTANCE_ID,
+    RegisterTaskInstanceRequest,
+    SubmitTaskResultResponse,
     TaskLatency,
-    compress_bytes, hex_encode,
-    job_state_is_terminal, make_random_payload, report_stats,
+    compress_bytes, job_state_is_terminal, make_random_payload, report_stats,
 };
 
 // =============================================================================
@@ -29,7 +29,6 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = Compression::None)]
     compression: Compression,
 
-    /// Size of each output payload in bytes.
     #[arg(long, default_value_t = 1024)]
     input_size: usize,
 }
@@ -120,7 +119,7 @@ async fn worker_loop(
             break;
         }
 
-        // Step 1: Get a ready task from this worker's dedicated queue. Retry if empty.
+        // Step 1: Get a ready task (JSON — tiny payload).
         let task_index = loop {
             if *done_rx.borrow() {
                 return;
@@ -141,43 +140,49 @@ async fn worker_loop(
             tokio::task::yield_now().await;
         };
 
-        // Step 2: Register task instance (timed — includes network round-trip).
+        // Step 2: Register task instance (timed).
+        // Request is JSON (task_index), response is raw binary body + instance_id in header.
         let register_start = Instant::now();
-        let register_resp: RegisterTaskInstanceResponse = http_client
+        let register_resp = http_client
             .post(&register_url)
             .json(&RegisterTaskInstanceRequest { task_index })
             .send()
             .await
-            .expect("RegisterTaskInstance request should succeed")
-            .json()
+            .expect("RegisterTaskInstance request should succeed");
+
+        let task_instance_id: u64 = register_resp
+            .headers()
+            .get(HEADER_TASK_INSTANCE_ID)
+            .expect("response should have x-task-instance-id header")
+            .to_str()
+            .expect("header should be valid str")
+            .parse()
+            .expect("header should be valid u64");
+
+        // Read raw binary body (inputs). Not timed beyond the HTTP round-trip.
+        let _inputs_bytes = register_resp
+            .bytes()
             .await
-            .expect("RegisterTaskInstance response should deserialize");
+            .expect("should read response body");
         let register_duration = register_start.elapsed();
 
-        // Inputs received are already compressed (stored that way in the cache).
-        // Decompression happens here, outside timing, simulating real worker behavior.
-        let _inputs_compressed = register_resp.inputs_b64; // would decompress in real use
-
-        // Step 3: Produce randomized 1KB output, compress it (outside timing).
-        // The compressed bytes are what the server stores in the cache.
+        // Step 3: Produce output (outside timing).
         let raw_output = make_random_payload(input_size);
         let compressed_output = compress_bytes(&raw_output, compression);
         let outputs: Vec<Vec<u8>> = vec![compressed_output];
         let outputs_bytes =
             rmp_serde::to_vec(&outputs).expect("output serialization should succeed");
-        let outputs_hex = hex_encode(&outputs_bytes);
 
-        // Step 4: Submit result (timed — includes network round-trip).
+        // Step 4: Submit result (timed).
+        // Request is raw binary body with metadata in headers. Response is JSON.
         let submit_start = Instant::now();
         let submit_resp: SubmitTaskResultResponse = http_client
             .post(&submit_url)
-            .json(&SubmitTaskResultRequest {
-                task_instance_id: register_resp.task_instance_id,
-                task_index,
-                success: true,
-                outputs_b64: outputs_hex,
-                error_message: String::new(),
-            })
+            .header(HEADER_TASK_INSTANCE_ID, task_instance_id.to_string())
+            .header(HEADER_TASK_INDEX, task_index.to_string())
+            .header(HEADER_SUCCESS, "true")
+            .header(HEADER_ERROR_MESSAGE, "")
+            .body(outputs_bytes)
             .send()
             .await
             .expect("SubmitTaskResult request should succeed")
