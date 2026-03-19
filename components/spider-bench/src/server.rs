@@ -2,8 +2,14 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
+use std::time::Instant;
 
 use async_trait::async_trait;
+use axum::{
+    Json, Router,
+    extract::State,
+    routing::post,
+};
 use clap::Parser;
 use spider_core::{
     task::TaskIndex,
@@ -18,16 +24,18 @@ use spider_storage::cache::{
     error::InternalError,
 };
 use tokio::sync::Mutex;
-use tonic::{Request, Response, Status, transport::Server};
 
 use spider_bench::{
+    Compression,
+    GetReadyTaskRequest, GetReadyTaskResponse,
     MockDb, MockInstancePool,
+    RegisterTaskInstanceRequest, RegisterTaskInstanceResponse,
+    SubmitTaskResultRequest, SubmitTaskResultResponse,
+    avg_of,
     build_flat_graph, build_neural_net_graph,
-    job_state_to_proto,
-    proto::{
-        self,
-        bench_scheduler_server::{BenchScheduler, BenchSchedulerServer},
-    },
+    hex_decode, hex_encode,
+    job_state_to_string,
+    percentile,
 };
 
 // =============================================================================
@@ -35,7 +43,7 @@ use spider_bench::{
 // =============================================================================
 
 #[derive(Parser)]
-#[command(name = "cache-server", about = "Cache-layer benchmark server")]
+#[command(name = "cache-server", about = "Cache-layer benchmark server (REST)")]
 struct Cli {
     #[arg(long, default_value = "flat")]
     benchmark: String,
@@ -55,10 +63,11 @@ struct Cli {
     #[arg(long, default_value_t = 10)]
     neural_net_fan_in: usize,
 
-    /// Number of workers expected. Must match the client's --num-workers.
-    /// Used to create per-worker dispatch channels.
     #[arg(long, default_value_t = 128)]
     num_workers: usize,
+
+    #[arg(long, value_enum, default_value_t = Compression::None)]
+    compression: Compression,
 }
 
 // =============================================================================
@@ -98,10 +107,9 @@ impl ReadyQueueConnector for ServerReadyQueue {
 }
 
 // =============================================================================
-// gRPC service implementation
+// Server-side stats
 // =============================================================================
 
-/// Server-side latency collector for RPC handlers.
 struct ServerStats {
     register_durations: Mutex<Vec<std::time::Duration>>,
     submit_durations: Mutex<Vec<std::time::Duration>>,
@@ -130,150 +138,141 @@ impl ServerStats {
         eprintln!("=== Server-side RPC latencies ===");
         eprintln!("  --- RegisterTaskInstance (server) ---");
         eprintln!("    count:                       {:>10}", register_ms.len());
-        eprintln!(
-            "    avg:                         {:>10.3} ms",
-            spider_bench::avg_of(&register_ms)
-        );
-        eprintln!(
-            "    p50:                         {:>10.3} ms",
-            spider_bench::percentile(&register_ms, 50.0)
-        );
-        eprintln!(
-            "    p95:                         {:>10.3} ms",
-            spider_bench::percentile(&register_ms, 95.0)
-        );
-        eprintln!(
-            "    p99:                         {:>10.3} ms",
-            spider_bench::percentile(&register_ms, 99.0)
-        );
+        eprintln!("    avg:                         {:>10.3} ms", avg_of(&register_ms));
+        eprintln!("    p50:                         {:>10.3} ms", percentile(&register_ms, 50.0));
+        eprintln!("    p95:                         {:>10.3} ms", percentile(&register_ms, 95.0));
+        eprintln!("    p99:                         {:>10.3} ms", percentile(&register_ms, 99.0));
         eprintln!("  --- SubmitTaskResult (server) ---");
         eprintln!("    count:                       {:>10}", submit_ms.len());
-        eprintln!(
-            "    avg:                         {:>10.3} ms",
-            spider_bench::avg_of(&submit_ms)
-        );
-        eprintln!(
-            "    p50:                         {:>10.3} ms",
-            spider_bench::percentile(&submit_ms, 50.0)
-        );
-        eprintln!(
-            "    p95:                         {:>10.3} ms",
-            spider_bench::percentile(&submit_ms, 95.0)
-        );
-        eprintln!(
-            "    p99:                         {:>10.3} ms",
-            spider_bench::percentile(&submit_ms, 99.0)
-        );
+        eprintln!("    avg:                         {:>10.3} ms", avg_of(&submit_ms));
+        eprintln!("    p50:                         {:>10.3} ms", percentile(&submit_ms, 50.0));
+        eprintln!("    p95:                         {:>10.3} ms", percentile(&submit_ms, 95.0));
+        eprintln!("    p99:                         {:>10.3} ms", percentile(&submit_ms, 99.0));
         eprintln!();
     }
 }
 
-struct BenchService {
+// =============================================================================
+// Shared app state
+// =============================================================================
+
+struct AppState {
     jcb: Arc<Jcb>,
-    /// Per-worker receive channels. Indexed by `worker_id` from the request.
     worker_rxs: Vec<Mutex<tokio::sync::mpsc::UnboundedReceiver<TaskIndex>>>,
     done: Arc<AtomicBool>,
     stats: Arc<ServerStats>,
 }
 
-#[tonic::async_trait]
-impl BenchScheduler for BenchService {
-    async fn get_ready_task(
-        &self,
-        request: Request<proto::GetReadyTaskRequest>,
-    ) -> Result<Response<proto::GetReadyTaskResponse>, Status> {
-        if self.done.load(Ordering::Relaxed) {
-            return Ok(Response::new(proto::GetReadyTaskResponse {
-                has_task: false,
-                task_index: 0,
-            }));
-        }
+// =============================================================================
+// Route handlers
+// =============================================================================
 
-        let worker_id = request.into_inner().worker_id as usize;
-        if worker_id >= self.worker_rxs.len() {
-            return Err(Status::invalid_argument(format!(
-                "worker_id {worker_id} out of range (max {})",
-                self.worker_rxs.len() - 1
-            )));
-        }
-
-        // Each worker has its own channel — no contention with other workers.
-        let result = self.worker_rxs[worker_id].lock().await.try_recv();
-        match result {
-            Ok(task_index) => Ok(Response::new(proto::GetReadyTaskResponse {
-                has_task: true,
-                task_index: task_index as u64,
-            })),
-            Err(_) => Ok(Response::new(proto::GetReadyTaskResponse {
-                has_task: false,
-                task_index: 0,
-            })),
-        }
+async fn handle_get_ready_task(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<GetReadyTaskRequest>,
+) -> Json<GetReadyTaskResponse> {
+    if state.done.load(Ordering::Relaxed) {
+        return Json(GetReadyTaskResponse {
+            has_task: false,
+            task_index: 0,
+        });
     }
 
-    async fn register_task_instance(
-        &self,
-        request: Request<proto::RegisterTaskInstanceRequest>,
-    ) -> Result<Response<proto::RegisterTaskInstanceResponse>, Status> {
-        let start = std::time::Instant::now();
+    let worker_id = req.worker_id as usize;
+    if worker_id >= state.worker_rxs.len() {
+        return Json(GetReadyTaskResponse {
+            has_task: false,
+            task_index: 0,
+        });
+    }
 
-        let req = request.into_inner();
-        let task_index = req.task_index as usize;
+    let result = state.worker_rxs[worker_id].lock().await.try_recv();
+    match result {
+        Ok(task_index) => Json(GetReadyTaskResponse {
+            has_task: true,
+            task_index: task_index as u64,
+        }),
+        Err(_) => Json(GetReadyTaskResponse {
+            has_task: false,
+            task_index: 0,
+        }),
+    }
+}
 
-        let ctx = self
+async fn handle_register_task_instance(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RegisterTaskInstanceRequest>,
+) -> Json<RegisterTaskInstanceResponse> {
+    let start = Instant::now();
+
+    let task_index = req.task_index as usize;
+    let ctx = state
+        .jcb
+        .create_task_instance(TaskId::TaskIndex(task_index))
+        .await
+        .expect("create_task_instance should succeed");
+
+    // Time only the cache-layer call, not the serialization for transport.
+    state
+        .stats
+        .register_durations
+        .lock()
+        .await
+        .push(start.elapsed());
+
+    let inputs_bytes =
+        rmp_serde::to_vec(&ctx.inputs).expect("input serialization should succeed");
+
+    Json(RegisterTaskInstanceResponse {
+        task_instance_id: ctx.task_instance_id,
+        inputs_b64: hex_encode(&inputs_bytes),
+    })
+}
+
+async fn handle_submit_task_result(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SubmitTaskResultRequest>,
+) -> Json<SubmitTaskResultResponse> {
+    let start = Instant::now();
+
+    let task_index = req.task_index as usize;
+
+    // Server receives bytes as-is (compressed if client uses compression).
+    let job_state = if req.success {
+        let outputs_bytes = hex_decode(&req.outputs_b64);
+        let outputs: Vec<TaskOutput> =
+            rmp_serde::from_slice(&outputs_bytes).expect("output deserialization should succeed");
+        state
             .jcb
-            .create_task_instance(TaskId::TaskIndex(task_index))
+            .complete_task_instance(req.task_instance_id, task_index, outputs)
             .await
-            .map_err(|e| Status::internal(format!("create_task_instance failed: {e:?}")))?;
+            .expect("complete_task_instance should succeed")
+    } else {
+        state
+            .jcb
+            .fail_task_instance(
+                req.task_instance_id,
+                TaskId::TaskIndex(task_index),
+                req.error_message,
+            )
+            .await
+            .expect("fail_task_instance should succeed")
+    };
 
-        let inputs_bytes = rmp_serde::to_vec(&ctx.inputs)
-            .map_err(|e| Status::internal(format!("failed to serialize inputs: {e}")))?;
+    state
+        .stats
+        .submit_durations
+        .lock()
+        .await
+        .push(start.elapsed());
 
-        self.stats.register_durations.lock().await.push(start.elapsed());
-
-        Ok(Response::new(proto::RegisterTaskInstanceResponse {
-            task_instance_id: ctx.task_instance_id,
-            inputs: inputs_bytes,
-        }))
+    if job_state.is_terminal() {
+        state.done.store(true, Ordering::Relaxed);
     }
 
-    async fn submit_task_result(
-        &self,
-        request: Request<proto::SubmitTaskResultRequest>,
-    ) -> Result<Response<proto::SubmitTaskResultResponse>, Status> {
-        let start = std::time::Instant::now();
-
-        let req = request.into_inner();
-        let task_index = req.task_index as usize;
-
-        let state = if req.success {
-            let outputs: Vec<TaskOutput> = rmp_serde::from_slice(&req.outputs)
-                .map_err(|e| Status::internal(format!("failed to deserialize outputs: {e}")))?;
-            self.jcb
-                .complete_task_instance(req.task_instance_id, task_index, outputs)
-                .await
-                .map_err(|e| Status::internal(format!("complete_task_instance failed: {e:?}")))?
-        } else {
-            self.jcb
-                .fail_task_instance(
-                    req.task_instance_id,
-                    TaskId::TaskIndex(task_index),
-                    req.error_message,
-                )
-                .await
-                .map_err(|e| Status::internal(format!("fail_task_instance failed: {e:?}")))?
-        };
-
-        self.stats.submit_durations.lock().await.push(start.elapsed());
-
-        if state.is_terminal() {
-            self.done.store(true, Ordering::Relaxed);
-        }
-
-        Ok(Response::new(proto::SubmitTaskResultResponse {
-            job_state: job_state_to_proto(state),
-        }))
-    }
+    Json(SubmitTaskResultResponse {
+        job_state: job_state_to_string(job_state),
+    })
 }
 
 // =============================================================================
@@ -284,14 +283,14 @@ impl BenchScheduler for BenchService {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    // Build the graph.
     let (graph, job_inputs) = match cli.benchmark.as_str() {
-        "flat" => build_flat_graph(cli.num_tasks, 2, 1),
+        "flat" => build_flat_graph(cli.num_tasks, 2, 1, cli.compression),
         "neural-net" => {
             let (g, inputs, _layers) = build_neural_net_graph(
                 cli.neural_net_layers,
                 cli.neural_net_width,
                 cli.neural_net_fan_in,
+                cli.compression,
             );
             (g, inputs)
         }
@@ -307,7 +306,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli.benchmark
     );
 
-    // Create per-worker channels.
     let num_workers = cli.num_workers;
     let mut worker_txs = Vec::with_capacity(num_workers);
     let mut worker_rxs = Vec::with_capacity(num_workers);
@@ -322,7 +320,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         round_robin: AtomicU64::new(0),
     };
 
-    // Build the job.
     let (jcb, initial_ready) = build_job(
         JobId::new(),
         ResourceGroupId::new(),
@@ -336,7 +333,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("Job built: {} initially ready tasks", initial_ready.len());
 
-    // Seed initial ready tasks round-robin across worker channels.
     for (i, &idx) in initial_ready.iter().enumerate() {
         worker_txs[i % num_workers]
             .send(idx)
@@ -346,22 +342,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let done = Arc::new(AtomicBool::new(false));
     let stats = Arc::new(ServerStats::new());
 
-    let service = BenchService {
+    let app_state = Arc::new(AppState {
         jcb: Arc::new(jcb),
         worker_rxs,
         done: done.clone(),
         stats: Arc::clone(&stats),
-    };
+    });
 
-    let addr = format!("[::1]:{}", cli.port).parse()?;
+    let app = Router::new()
+        .route("/get_ready_task", post(handle_get_ready_task))
+        .route("/register_task_instance", post(handle_register_task_instance))
+        .route("/submit_task_result", post(handle_submit_task_result))
+        .with_state(app_state);
+
+    let addr = format!("[::1]:{}", cli.port);
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
     eprintln!("Server listening on {addr} ({num_workers} worker channels)");
 
-    Server::builder()
-        .add_service(BenchSchedulerServer::new(service))
-        .serve_with_shutdown(addr, async move {
+    // Serve until the job completes.
+    let done_for_shutdown = done.clone();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                if done.load(Ordering::Relaxed) {
+                if done_for_shutdown.load(Ordering::Relaxed) {
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     break;
                 }

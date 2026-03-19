@@ -1,11 +1,9 @@
-pub mod proto {
-    tonic::include_proto!("spider.bench");
-}
-
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use rand::Rng;
+use serde::{Deserialize, Serialize};
 use spider_core::{
     job::JobState,
     task::{
@@ -26,6 +24,145 @@ use spider_storage::{
 };
 
 // =============================================================================
+// REST API types (JSON-serializable)
+// =============================================================================
+
+#[derive(Serialize, Deserialize)]
+pub struct GetReadyTaskRequest {
+    pub worker_id: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct GetReadyTaskResponse {
+    pub has_task: bool,
+    pub task_index: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct RegisterTaskInstanceRequest {
+    pub task_index: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct RegisterTaskInstanceResponse {
+    pub task_instance_id: u64,
+    /// rmp_serde-serialized `Option<Vec<TaskInput>>`, base64-encoded.
+    pub inputs_b64: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct SubmitTaskResultRequest {
+    pub task_instance_id: u64,
+    pub task_index: u64,
+    pub success: bool,
+    /// rmp_serde-serialized `Vec<TaskOutput>`, base64-encoded (valid when success == true).
+    pub outputs_b64: String,
+    pub error_message: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct SubmitTaskResultResponse {
+    pub job_state: String,
+}
+
+// =============================================================================
+// Job state helpers
+// =============================================================================
+
+pub fn job_state_to_string(state: JobState) -> String {
+    match state {
+        JobState::Ready => "ready",
+        JobState::Running => "running",
+        JobState::CommitReady => "commit_ready",
+        JobState::CleanupReady => "cleanup_ready",
+        JobState::Succeeded => "succeeded",
+        JobState::Failed => "failed",
+        JobState::Cancelled => "cancelled",
+    }
+    .to_owned()
+}
+
+pub fn job_state_is_terminal(state: &str) -> bool {
+    matches!(state, "succeeded" | "failed" | "cancelled")
+}
+
+// =============================================================================
+// Compression (client-side only — server stores compressed bytes as-is)
+// =============================================================================
+
+/// Whether to compress payloads stored in the cache. Compression and decompression happen
+/// on the client side only. The server stores and serves compressed bytes opaquely.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum Compression {
+    None,
+    Zstd,
+}
+
+impl std::fmt::Display for Compression {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => write!(f, "none"),
+            Self::Zstd => write!(f, "zstd"),
+        }
+    }
+}
+
+/// Compress raw bytes. Returns the input unchanged if compression is `None`.
+pub fn compress_bytes(data: &[u8], compression: Compression) -> Vec<u8> {
+    match compression {
+        Compression::None => data.to_vec(),
+        Compression::Zstd => {
+            zstd::encode_all(std::io::Cursor::new(data), 3)
+                .expect("zstd compression should succeed")
+        }
+    }
+}
+
+/// Decompress bytes. Returns the input unchanged if compression is `None`.
+pub fn decompress_bytes(data: &[u8], compression: Compression) -> Vec<u8> {
+    match compression {
+        Compression::None => data.to_vec(),
+        Compression::Zstd => {
+            zstd::decode_all(std::io::Cursor::new(data))
+                .expect("zstd decompression should succeed")
+        }
+    }
+}
+
+/// Hex-encode bytes for JSON transport (no compression — just encoding).
+pub fn hex_encode(data: &[u8]) -> String {
+    use std::io::Write;
+    let mut buf = Vec::with_capacity(data.len() * 2);
+    for byte in data {
+        write!(buf, "{byte:02x}").expect("hex encoding should not fail");
+    }
+    String::from_utf8(buf).expect("hex is valid utf8")
+}
+
+/// Hex-decode bytes from JSON transport (no decompression — just decoding).
+pub fn hex_decode(s: &str) -> Vec<u8> {
+    let mut result = Vec::with_capacity(s.len() / 2);
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        let hi = hex_val(bytes[i]);
+        let lo = hex_val(bytes[i + 1]);
+        result.push((hi << 4) | lo);
+        i += 2;
+    }
+    result
+}
+
+fn hex_val(b: u8) -> u8 {
+    match b {
+        b'0'..=b'9' => b - b'0',
+        b'a'..=b'f' => b - b'a' + 10,
+        b'A'..=b'F' => b - b'A' + 10,
+        _ => 0,
+    }
+}
+
+// =============================================================================
 // Graph builders (ported from spider-storage tests)
 // =============================================================================
 
@@ -37,10 +174,19 @@ pub fn make_1kb_payload() -> Vec<u8> {
     vec![0xab_u8; 1024]
 }
 
+/// Generate a 1KB payload filled with random bytes (incompressible data).
+pub fn make_random_1kb_payload() -> Vec<u8> {
+    let mut rng = rand::thread_rng();
+    let mut buf = vec![0u8; 128];
+    rng.fill(buf.as_mut_slice());
+    buf
+}
+
 pub fn build_flat_graph(
     num_tasks: usize,
     num_inputs_per_task: usize,
     num_outputs_per_task: usize,
+    compression: Compression,
 ) -> (CoreTaskGraph, Vec<TaskInput>) {
     let mut graph = CoreTaskGraph::default();
     for i in 0..num_tasks {
@@ -55,8 +201,9 @@ pub fn build_flat_graph(
             })
             .expect("flat graph task insertion should succeed");
     }
+    // Job inputs are pre-compressed so the cache stores compressed bytes directly.
     let job_inputs: Vec<TaskInput> = (0..num_tasks * num_inputs_per_task)
-        .map(|_| TaskInput::ValuePayload(make_1kb_payload()))
+        .map(|_| TaskInput::ValuePayload(compress_bytes(&make_random_1kb_payload(), compression)))
         .collect();
     (graph, job_inputs)
 }
@@ -65,6 +212,7 @@ pub fn build_neural_net_graph(
     num_layers: usize,
     width: usize,
     fan_in: usize,
+    compression: Compression,
 ) -> (CoreTaskGraph, Vec<TaskInput>, Vec<Vec<TaskIndex>>) {
     let mut graph = CoreTaskGraph::default();
     let mut layers: Vec<Vec<TaskIndex>> = Vec::with_capacity(num_layers);
@@ -116,8 +264,9 @@ pub fn build_neural_net_graph(
         layers.push(current_layer);
     }
 
+    // Job inputs are pre-compressed so the cache stores compressed bytes directly.
     let job_inputs: Vec<TaskInput> = (0..width * fan_in)
-        .map(|_| TaskInput::ValuePayload(make_1kb_payload()))
+        .map(|_| TaskInput::ValuePayload(compress_bytes(&make_random_1kb_payload(), compression)))
         .collect();
 
     (graph, job_inputs, layers)
@@ -201,29 +350,6 @@ impl TaskInstancePoolConnector for MockInstancePool {
 }
 
 // =============================================================================
-// Proto enum conversion
-// =============================================================================
-
-pub fn job_state_to_proto(state: JobState) -> i32 {
-    match state {
-        JobState::Ready => proto::JobState::Ready.into(),
-        JobState::Running => proto::JobState::Running.into(),
-        JobState::CommitReady => proto::JobState::CommitReady.into(),
-        JobState::CleanupReady => proto::JobState::CleanupReady.into(),
-        JobState::Succeeded => proto::JobState::Succeeded.into(),
-        JobState::Failed => proto::JobState::Failed.into(),
-        JobState::Cancelled => proto::JobState::Cancelled.into(),
-    }
-}
-
-pub fn proto_job_state_is_terminal(state: i32) -> bool {
-    matches!(
-        proto::JobState::try_from(state),
-        Ok(proto::JobState::Succeeded | proto::JobState::Failed | proto::JobState::Cancelled)
-    )
-}
-
-// =============================================================================
 // Stats utilities
 // =============================================================================
 
@@ -252,6 +378,7 @@ pub fn avg_of(values: &[f64]) -> f64 {
 pub fn report_stats(
     test_name: &str,
     num_workers: usize,
+    compression: Compression,
     total_execution: Duration,
     latencies: &[TaskLatency],
 ) {
@@ -263,18 +390,18 @@ pub fn report_stats(
     submit_ms.sort_by(|a, b| a.partial_cmp(b).expect("latencies should be comparable"));
 
     eprintln!();
-    eprintln!("=== {test_name} ({num_workers} workers, gRPC) ===");
+    eprintln!("=== {test_name} ({num_workers} workers, REST, compression={compression}) ===");
     eprintln!(
         "  total_execution:             {:>10.2} ms",
         to_ms(&total_execution)
     );
     eprintln!("  tasks_completed:              {:>10}", latencies.len());
-    eprintln!("  --- RegisterTaskInstance (gRPC) ---");
+    eprintln!("  --- RegisterTaskInstance (REST) ---");
     eprintln!("    avg:                         {:>10.3} ms", avg_of(&register_ms));
     eprintln!("    p50:                         {:>10.3} ms", percentile(&register_ms, 50.0));
     eprintln!("    p95:                         {:>10.3} ms", percentile(&register_ms, 95.0));
     eprintln!("    p99:                         {:>10.3} ms", percentile(&register_ms, 99.0));
-    eprintln!("  --- SubmitTaskResult (gRPC) ---");
+    eprintln!("  --- SubmitTaskResult (REST) ---");
     eprintln!("    avg:                         {:>10.3} ms", avg_of(&submit_ms));
     eprintln!("    p50:                         {:>10.3} ms", percentile(&submit_ms, 50.0));
     eprintln!("    p95:                         {:>10.3} ms", percentile(&submit_ms, 95.0));

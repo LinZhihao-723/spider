@@ -15,11 +15,12 @@ path = "src/client.rs"
 spider-core = { path = "../spider-core" }
 spider-storage = { path = "../spider-storage" }
 async-trait = "0.1"
+axum = { version = "0.7", features = ["json"] }
 clap = { version = "4", features = ["derive"] }
-prost = "0.13"
-tokio = { version = "1.49", features = ["rt-multi-thread", "sync", "macros", "signal"] }
-tonic = "0.12"
+reqwest = { version = "0.12", features = ["json"] }
+rand = "0.8"
 rmp-serde = "1.3"
-
-[build-dependencies]
-tonic-build = "0.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.49", features = ["rt-multi-thread", "sync", "macros", "signal"] }
+zstd = "0.13"

@@ -1,5 +1,6 @@
 use std::{collections::HashSet, sync::Arc};
 
+use serde::Serialize;
 use spider_core::{
     task::{TaskIndex, TaskState},
     types::{
@@ -83,7 +84,6 @@ impl SharedTaskControlBlock {
         let mut tcb = self.inner.lock().await;
         tcb.base.register_task_instance(task_instance_id)?;
 
-        // NOTE: The following execution can only fail due to internal errors.
         let result: Result<_, InternalError> = {
             let inputs = tcb.fetch_inputs().await?;
             let execution_context = ExecutionContext {
@@ -344,6 +344,35 @@ impl TaskControlBlock {
     }
 }
 
+/// Serializes inputs from shared buffers into msgpack format without holding the TCB mutex.
+/// Each input buffer is read-locked individually, its bytes copied, then the lock is released
+/// before moving to the next input. The final serialization step borrows the collected bytes
+/// without a second copy.
+async fn serialize_inputs(input_readers: &[InputReader]) -> Result<Vec<u8>, InternalError> {
+    let mut input_bytes: Vec<Vec<u8>> = Vec::with_capacity(input_readers.len());
+    for input_reader in input_readers {
+        match input_reader {
+            InputReader::Value(reader) => {
+                let guard = reader.read().await;
+                let bytes = guard
+                    .as_ref()
+                    .ok_or(InternalError::TaskInputNotReady)?
+                    .clone();
+                drop(guard);
+                input_bytes.push(bytes);
+            }
+            InputReader::Channel(_) => unimplemented!("channel input is not supported yet"),
+        }
+    }
+
+    let refs: Vec<TaskInputRef<'_>> = input_bytes
+        .iter()
+        .map(|b| TaskInputRef::ValuePayload(b.as_slice()))
+        .collect();
+
+    rmp_serde::to_vec(&refs).map_err(|_| InternalError::TaskInputNotReady)
+}
+
 pub(super) struct TerminationTaskControlBlock {
     pub(super) base: BaseTaskControlBlock,
 }
@@ -354,6 +383,7 @@ pub(super) type ValuePayload = Option<Vec<u8>>;
 pub(super) struct Channel {}
 
 #[allow(dead_code)]
+#[derive(Clone)]
 pub(super) enum InputReader {
     Value(Reader<ValuePayload>),
     Channel(Channel),
@@ -373,6 +403,13 @@ impl InputReader {
             Self::Channel(_) => unimplemented!("channel input is not supported yet"),
         }
     }
+}
+
+/// A borrowing reference to a task input's payload, used for zero-copy serialization.
+/// Mirrors `TaskInput` but borrows `&[u8]` instead of owning `Vec<u8>`.
+#[derive(Serialize)]
+enum TaskInputRef<'a> {
+    ValuePayload(&'a [u8]),
 }
 
 pub(super) type OutputReader = Reader<ValuePayload>;
