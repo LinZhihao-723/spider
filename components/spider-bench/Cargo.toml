@@ -14,6 +14,7 @@ path = "src/client.rs"
 [dependencies]
 spider-core = { path = "../spider-core" }
 spider-storage = { path = "../spider-storage" }
+async-channel = "2"
 async-trait = "0.1"
 axum = { version = "0.7", features = ["json"] }
 clap = { version = "4", features = ["derive"] }

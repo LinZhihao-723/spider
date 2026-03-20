@@ -7,48 +7,35 @@ use spider_bench::{
     Compression,
     GetReadyTaskRequest, GetReadyTaskResponse,
     HEADER_ERROR_MESSAGE, HEADER_SUCCESS, HEADER_TASK_INDEX, HEADER_TASK_INSTANCE_ID,
-    RegisterTaskInstanceRequest,
-    SubmitTaskResultResponse,
-    TaskLatency,
+    RegisterTaskInstanceRequest, SubmitTaskResultResponse, TaskLatency,
     compress_bytes, job_state_is_terminal, make_random_payload, report_stats,
 };
 
-// =============================================================================
-// CLI
-// =============================================================================
-
 #[derive(Parser)]
-#[command(name = "worker-client", about = "Cache-layer benchmark worker client (REST)")]
+#[command(name = "worker-client")]
 struct Cli {
     #[arg(long, default_value = "http://[::1]:50051")]
     server_addr: String,
-
     #[arg(long, default_value_t = 128)]
     num_workers: usize,
-
     #[arg(long, value_enum, default_value_t = Compression::None)]
     compression: Compression,
-
     #[arg(long, default_value_t = 1024)]
     input_size: usize,
+    #[arg(long, default_value_t = 0)]
+    worker_id_offset: u32,
 }
-
-// =============================================================================
-// Main
-// =============================================================================
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-
     let http_client = reqwest::Client::new();
 
     eprintln!(
-        "Connecting to server at {} (compression={})",
-        cli.server_addr, cli.compression
+        "Connecting to server at {} (compression={}, workers={}, offset={})",
+        cli.server_addr, cli.compression, cli.num_workers, cli.worker_id_offset
     );
 
-    // Wait for the server to be reachable before spawning workers.
     wait_for_server(&http_client, &cli.server_addr).await;
     eprintln!("Server is ready.");
 
@@ -67,19 +54,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut done_rx = done_rx.clone();
         let compression = cli.compression;
         let input_size = cli.input_size;
+        let gid = worker_id as u32 + cli.worker_id_offset;
 
         handles.push(tokio::spawn(async move {
             worker_loop(
-                worker_id as u32,
-                &http_client,
-                &base_url,
-                compression,
-                input_size,
-                latencies,
-                &done_tx,
-                &mut done_rx,
-            )
-            .await;
+                gid, &http_client, &base_url, compression, input_size,
+                latencies, &done_tx, &mut done_rx,
+            ).await;
         }));
     }
 
@@ -88,34 +69,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let total_execution = exec_start.elapsed();
-
     let latencies = Arc::try_unwrap(latencies)
         .expect("all workers should have finished")
         .into_inner();
 
-    report_stats(
-        "Benchmark",
-        cli.num_workers,
-        cli.compression,
-        total_execution,
-        &latencies,
-    );
-
+    report_stats("Benchmark", cli.num_workers, cli.compression, total_execution, &latencies);
     Ok(())
 }
 
-/// Polls the server until it responds, retrying with backoff. Gives up after 60 seconds.
 async fn wait_for_server(http_client: &reqwest::Client, base_url: &str) {
-    let url = format!("{base_url}/get_ready_task");
+    let url = format!("{base_url}/health");
     let deadline = Instant::now() + std::time::Duration::from_secs(60);
-
     loop {
-        match http_client
-            .post(&url)
-            .json(&GetReadyTaskRequest { worker_id: 0 })
-            .send()
-            .await
-        {
+        match http_client.get(&url).send().await {
             Ok(_) => return,
             Err(e) => {
                 if Instant::now() > deadline {
@@ -146,7 +112,8 @@ async fn worker_loop(
             break;
         }
 
-        // Step 1: Get a ready task. Retry on connection errors and empty queue.
+        // Get a ready task. Retry on empty queue or connection errors.
+        let mut consecutive_errors: u32 = 0;
         let task_index = loop {
             if *done_rx.borrow() {
                 return;
@@ -159,9 +126,9 @@ async fn worker_loop(
 
             match result {
                 Ok(resp) => {
+                    consecutive_errors = 0;
                     let ready: GetReadyTaskResponse = resp
-                        .json()
-                        .await
+                        .json().await
                         .expect("GetReadyTask response should deserialize");
                     if ready.has_task {
                         break ready.task_index;
@@ -169,6 +136,10 @@ async fn worker_loop(
                     tokio::task::yield_now().await;
                 }
                 Err(e) if e.is_connect() || e.is_timeout() => {
+                    consecutive_errors += 1;
+                    if consecutive_errors > 5 {
+                        return;
+                    }
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
                 Err(e) => {
@@ -178,41 +149,33 @@ async fn worker_loop(
             }
         };
 
-        // Step 2: Register task instance (timed).
-        // Request is JSON (task_index), response is raw binary body + instance_id in header.
+        // Register task instance (timed).
         let register_start = Instant::now();
         let register_resp = http_client
             .post(&register_url)
             .json(&RegisterTaskInstanceRequest { task_index })
-            .send()
-            .await
-            .expect("RegisterTaskInstance request should succeed");
+            .send().await
+            .expect("RegisterTaskInstance should succeed");
 
         let task_instance_id: u64 = register_resp
             .headers()
             .get(HEADER_TASK_INSTANCE_ID)
-            .expect("response should have x-task-instance-id header")
-            .to_str()
-            .expect("header should be valid str")
-            .parse()
-            .expect("header should be valid u64");
+            .expect("missing x-task-instance-id")
+            .to_str().expect("str").parse().expect("u64");
 
-        // Read raw binary body (inputs). Not timed beyond the HTTP round-trip.
-        let _inputs_bytes = register_resp
-            .bytes()
-            .await
-            .expect("should read response body");
+        let _inputs = register_resp.bytes().await.expect("read body");
         let register_duration = register_start.elapsed();
 
-        // Step 3: Produce output (outside timing).
+        // Simulate 10ms task execution.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Produce output (not timed).
         let raw_output = make_random_payload(input_size);
         let compressed_output = compress_bytes(&raw_output, compression);
         let outputs: Vec<Vec<u8>> = vec![compressed_output];
-        let outputs_bytes =
-            rmp_serde::to_vec(&outputs).expect("output serialization should succeed");
+        let outputs_bytes = rmp_serde::to_vec(&outputs).expect("serialize outputs");
 
-        // Step 4: Submit result (timed).
-        // Request is raw binary body with metadata in headers. Response is JSON.
+        // Submit result (timed).
         let submit_start = Instant::now();
         let submit_resp: SubmitTaskResultResponse = http_client
             .post(&submit_url)
@@ -221,12 +184,8 @@ async fn worker_loop(
             .header(HEADER_SUCCESS, "true")
             .header(HEADER_ERROR_MESSAGE, "")
             .body(outputs_bytes)
-            .send()
-            .await
-            .expect("SubmitTaskResult request should succeed")
-            .json()
-            .await
-            .expect("SubmitTaskResult response should deserialize");
+            .send().await.expect("SubmitTaskResult should succeed")
+            .json().await.expect("deserialize response");
         let submit_duration = submit_start.elapsed();
 
         latencies.lock().await.push(TaskLatency {
