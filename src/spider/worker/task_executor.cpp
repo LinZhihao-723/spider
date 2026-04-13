@@ -1,7 +1,3 @@
-#include <unistd.h>
-
-#include <cerrno>
-#include <csignal>
 #include <exception>
 #include <memory>
 #include <optional>
@@ -17,7 +13,6 @@
 #include <boost/uuid/string_generator.hpp>
 #include <boost/uuid/uuid.hpp>
 #include <fmt/format.h>
-#include <spdlog/sinks/stdout_color_sinks.h>  // IWYU pragma: keep
 #include <spdlog/spdlog.h>
 
 #include <spider/client/TaskContext.hpp>
@@ -27,6 +22,8 @@
 #include <spider/storage/MetadataStorage.hpp>
 #include <spider/storage/mysql/MySqlStorageFactory.hpp>
 #include <spider/storage/StorageFactory.hpp>
+#include <spider/utils/env.hpp>
+#include <spider/utils/logging.hpp>
 #include <spider/worker/DllLoader.hpp>
 #include <spider/worker/FunctionManager.hpp>
 #include <spider/worker/message_pipe.hpp>
@@ -46,6 +43,16 @@ auto parse_arg(int const argc, char** const& argv) -> boost::program_options::va
             "libs",
             boost::program_options::value<std::vector<std::string>>(),
             "dynamic libraries that include the spider tasks"
+    );
+    desc.add_options()(
+            "input-pipe",
+            boost::program_options::value<int>(),
+            "file number of the input pipe"
+    );
+    desc.add_options()(
+            "output-pipe",
+            boost::program_options::value<int>(),
+            "file number of the output pipe"
     );
     desc.add_options()(
             "storage_url",
@@ -73,19 +80,14 @@ constexpr int cResultSendErr = 6;
 constexpr int cOtherErr = 7;
 
 auto main(int const argc, char** argv) -> int {
-    // Set up spdlog to write to stderr
-    // NOLINTNEXTLINE(misc-include-cleaner)
-    spdlog::set_default_logger(spdlog::stderr_color_mt("stderr"));
-    spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [spider.executor] %v");
-#ifndef NDEBUG
-    spdlog::set_level(spdlog::level::trace);
-#endif
-
     boost::program_options::variables_map const args = parse_arg(argc, argv);
 
     std::string func_name;
     std::string storage_url;
     std::string task_id_string;
+    int input_pipe_fd{-1};
+    int output_pipe_fd{-1};
+    boost::uuids::uuid task_id;
     try {
         if (!args.contains("func")) {
             return cCmdArgParseErr;
@@ -95,10 +97,44 @@ auto main(int const argc, char** argv) -> int {
             return cCmdArgParseErr;
         }
         task_id_string = args["task_id"].as<std::string>();
-        if (!args.contains("storage_url")) {
+        if (false == args.contains("input-pipe")) {
             return cCmdArgParseErr;
         }
-        storage_url = args["storage_url"].as<std::string>();
+        task_id = boost::uuids::string_generator{}(task_id_string);
+
+        spider::utils::setup_directory_logger("task", "spider.executor", task_id);
+
+        input_pipe_fd = args["input-pipe"].as<int>();
+        if (input_pipe_fd < 0) {
+            spdlog::error("Invalid input pipe file descriptor: {}", input_pipe_fd);
+            return cCmdArgParseErr;
+        }
+        if (false == args.contains("output-pipe")) {
+            return cCmdArgParseErr;
+        }
+        output_pipe_fd = args["output-pipe"].as<int>();
+        if (output_pipe_fd < 0) {
+            spdlog::error("Invalid output pipe file descriptor: {}", output_pipe_fd);
+            return cCmdArgParseErr;
+        }
+        auto const optional_storage_url_env = spider::utils::get_env(spider::utils::cStorageUrlEnv);
+        if (optional_storage_url_env.has_value()) {
+            storage_url = optional_storage_url_env.value();
+        } else if (args.contains("storage_url")) {
+            spdlog::warn(
+                    "Prefer using `{}` environment variable over `--storage_url` argument.",
+                    spider::utils::cStorageUrlEnv
+            );
+            storage_url = args["storage_url"].as<std::string>();
+        } else {
+            spdlog::error(
+                    "Storage URL must be provided via `{}` environment variable or `--storage_url` "
+                    "argument.",
+                    spider::utils::cStorageUrlEnv
+            );
+            return cCmdArgParseErr;
+        }
+
         if (!args.contains("libs")) {
             return cCmdArgParseErr;
         }
@@ -119,8 +155,6 @@ auto main(int const argc, char** argv) -> int {
 
     try {
         // Parse task id
-        boost::uuids::string_generator const gen;
-        boost::uuids::uuid const task_id = gen(task_id_string);
 
         // Set up storage
         std::shared_ptr<spider::core::StorageFactory> const storage_factory
@@ -132,8 +166,8 @@ auto main(int const argc, char** argv) -> int {
 
         // Set up asio
         boost::asio::io_context context;
-        boost::asio::posix::stream_descriptor in(context, dup(STDIN_FILENO));
-        boost::asio::posix::stream_descriptor out(context, dup(STDOUT_FILENO));
+        boost::asio::posix::stream_descriptor in(context, input_pipe_fd);
+        boost::asio::posix::stream_descriptor out(context, output_pipe_fd);
 
         // Get args buffer from stdin
         std::optional<msgpack::sbuffer> request_buffer_option = spider::worker::receive_message(in);
