@@ -3,6 +3,8 @@ mod mysql;
 use proc_macro::TokenStream;
 use syn::{DeriveInput, parse_macro_input};
 
+/// Change
+
 /// Derives MySQL-compatible enum support for use with [`sqlx`].
 ///
 /// This derive macro generates the necessary trait implementations and helper methods to store a
