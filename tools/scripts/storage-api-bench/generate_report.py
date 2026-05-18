@@ -94,10 +94,23 @@ class RunSummary:
         return max(self.client_avg_us - self.server_avg_us, 0.0)
 
 
+@dataclass(frozen=True)
+class SizeRow:
+    workload: str
+    protocol: str
+    operation: str
+    count: int
+    avg_bytes: float
+    p50_bytes: float
+    p99_bytes: float
+    max_bytes: float
+    total_bytes: float
+
+
 def main() -> int:
     args = parse_args()
     data_dir = args.data_dir.resolve()
-    request_rows, phase_rows, summaries = load_results(data_dir)
+    request_rows, phase_rows, summaries, size_rows = load_results(data_dir)
     chart_paths = []
     for workload in WORKLOADS:
         chart_path = data_dir / f"avg_request_time_{workload}.png"
@@ -109,6 +122,7 @@ def main() -> int:
         request_rows,
         phase_rows,
         summaries,
+        size_rows,
     )
     for path in [*chart_paths, data_dir / "benchmark_report.md"]:
         print(path)
@@ -123,10 +137,11 @@ def parse_args() -> argparse.Namespace:
 
 def load_results(
     data_dir: pathlib.Path,
-) -> tuple[list[RequestRow], list[RequestRow], list[RunSummary]]:
+) -> tuple[list[RequestRow], list[RequestRow], list[RunSummary], list[SizeRow]]:
     request_rows: list[RequestRow] = []
     phase_rows: list[RequestRow] = []
     summaries: list[RunSummary] = []
+    size_rows: list[SizeRow] = []
     for path in sorted(data_dir.glob("*.json")):
         data = json.loads(path.read_text(encoding="utf-8"))
         if not {"setup", "request_latency", "server_metrics", "job_latency"} <= data.keys():
@@ -190,10 +205,25 @@ def load_results(
                 setup=setup,
             )
         )
+        for size_row in data["server_metrics"].get("request_sizes", []):
+            size_rows.append(
+                SizeRow(
+                    workload=workload,
+                    protocol=protocol,
+                    operation=size_row["operation"],
+                    count=size_row["count"],
+                    avg_bytes=size_row["avg_bytes"],
+                    p50_bytes=size_row.get("p50_bytes", 0),
+                    p99_bytes=size_row.get("p99_bytes", 0),
+                    max_bytes=size_row.get("max_bytes", 0),
+                    total_bytes=size_row.get("total_bytes", 0),
+                )
+            )
     request_rows.sort(key=lambda row: (WORKLOADS.index(row.workload), sort_key((row.category, row.operation)), PROTOCOLS.index(row.protocol)))
     phase_rows.sort(key=lambda row: (WORKLOADS.index(row.workload), row.operation, PROTOCOLS.index(row.protocol)))
     summaries.sort(key=lambda row: (WORKLOADS.index(row.workload), PROTOCOLS.index(row.protocol)))
-    return request_rows, phase_rows, summaries
+    size_rows.sort(key=lambda row: (WORKLOADS.index(row.workload), row.operation, PROTOCOLS.index(row.protocol)))
+    return request_rows, phase_rows, summaries, size_rows
 
 
 def sort_key(key: tuple[str, str]) -> tuple[int, str]:
@@ -464,6 +494,7 @@ def write_report(
     request_rows: list[RequestRow],
     phase_rows: list[RequestRow],
     summaries: list[RunSummary],
+    size_rows: list[SizeRow],
 ) -> None:
     setup = summaries[0].setup
     summary_by_key = {(row.workload, row.protocol): row for row in summaries}
@@ -519,6 +550,9 @@ def write_report(
         lines.append(
             f"| {row.workload} | {row.protocol} | {job['count']} | {job['failed_jobs']} | {fmt_ms(job['p50_us'])} | {fmt_ms(job['p90_us'])} | {fmt_ms(job['p99_us'])} | {fmt_ms(job['max_us'])} |"
         )
+
+    if size_rows:
+        lines.extend(size_summary_section(size_rows))
 
     lines.extend(
         [
@@ -652,6 +686,91 @@ def fmt_us(value: float) -> str:
 
 def fmt_ms(value: float) -> str:
     return f"{value / 1000:,.3f}"
+
+
+def fmt_bytes(value: float) -> str:
+    return f"{value:,.0f}"
+
+
+def size_summary_section(size_rows: list[SizeRow]) -> list[str]:
+    by_workload_op: dict[tuple[str, str], dict[str, SizeRow]] = {}
+    for row in size_rows:
+        by_workload_op.setdefault((row.workload, row.operation), {})[row.protocol] = row
+
+    by_op: dict[str, list[SizeRow]] = {}
+    for row in size_rows:
+        by_op.setdefault(row.operation, []).append(row)
+    operations = sorted(by_op.keys())
+
+    pair_operations = sorted(
+        {
+            operation
+            for operation in operations
+            if any(
+                operation.endswith("_uncompressed_bytes")
+                and operation.removesuffix("_uncompressed_bytes") + "_compressed_bytes" in by_op
+                for _ in [None]
+            )
+        }
+    )
+
+    lines: list[str] = ["", "## Task Graph Upload Size", ""]
+    lines.append(
+        "Bytes recorded per `register_job` call on the storage server. `Uncompressed` is the "
+        "JSON encoding of the task graph; `Compressed` is what is bound to the "
+        "`serialized_task_graph` column (zstd level 3). Ratio is `compressed / uncompressed`."
+    )
+    lines.append("")
+
+    if pair_operations:
+        lines.extend(
+            [
+                "### Compression Ratio",
+                "",
+                "| Workload | Protocol | Operation | Count | Uncompressed avg (B) | Compressed avg (B) | Ratio |",
+                "|---|---:|---|---:|---:|---:|---:|",
+            ]
+        )
+        for workload in WORKLOADS:
+            for protocol in PROTOCOLS:
+                for pair_op in pair_operations:
+                    base = pair_op.removesuffix("_uncompressed_bytes")
+                    compressed_op = base + "_compressed_bytes"
+                    pair_uncompressed = by_workload_op.get((workload, pair_op), {}).get(protocol)
+                    pair_compressed = by_workload_op.get((workload, compressed_op), {}).get(
+                        protocol
+                    )
+                    if pair_uncompressed is None or pair_compressed is None:
+                        continue
+                    if pair_uncompressed.avg_bytes <= 0:
+                        ratio_text = "n/a"
+                    else:
+                        ratio_text = (
+                            f"{pair_compressed.avg_bytes / pair_uncompressed.avg_bytes:.3f}"
+                        )
+                    lines.append(
+                        f"| {workload} | {protocol} | `{base}` | {pair_uncompressed.count:,} | "
+                        f"{fmt_bytes(pair_uncompressed.avg_bytes)} | "
+                        f"{fmt_bytes(pair_compressed.avg_bytes)} | {ratio_text} |"
+                    )
+        lines.append("")
+
+    lines.extend(
+        [
+            "### Per-Operation Size Detail",
+            "",
+            "| Workload | Protocol | Operation | Count | avg (B) | p50 (B) | p99 (B) | max (B) | total (B) |",
+            "|---|---:|---|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for row in size_rows:
+        lines.append(
+            f"| {row.workload} | {row.protocol} | `{row.operation}` | {row.count:,} | "
+            f"{fmt_bytes(row.avg_bytes)} | {fmt_bytes(row.p50_bytes)} | "
+            f"{fmt_bytes(row.p99_bytes)} | {fmt_bytes(row.max_bytes)} | "
+            f"{fmt_bytes(row.total_bytes)} |"
+        )
+    return lines
 
 
 if __name__ == "__main__":

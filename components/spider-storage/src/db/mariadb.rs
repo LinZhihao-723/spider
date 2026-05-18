@@ -22,7 +22,9 @@ use crate::{
         ExecutionManagerLivenessManagement,
         ExternalJobOrchestration,
         InternalJobOrchestration,
+        RegisteredJob,
         ResourceGroupManagement,
+        SerializedBytes,
         SessionManagement,
         error::ExpectedStates,
     },
@@ -99,19 +101,29 @@ impl ExternalJobOrchestration for MariaDbStorageConnector {
         &self,
         resource_group_id: ResourceGroupId,
         job_submission: &ValidatedJobSubmission,
-    ) -> Result<JobId, DbError> {
+    ) -> Result<RegisteredJob, DbError> {
         const INSERT_QUERY: &str = formatcp!(
             "INSERT INTO `{table}` (`resource_group_id`, `serialized_task_graph`, \
-             `serialized_job_inputs`) VALUES (?, ?, ?) RETURNING CAST(`id` AS BINARY(16)) AS `id`;",
+             `serialized_job_inputs`) VALUES (?, ?, ?) RETURNING `id`;",
             table = JOBS_TABLE_NAME,
         );
 
         let task_graph = job_submission.task_graph();
         let job_inputs = job_submission.inputs();
-        let serialized_task_graph = task_graph
+        let task_graph_json = task_graph
             .to_json()
             .map_err(|e| DbError::TaskGraphSerializationFailure(Box::new(e)))?;
-        let serialized_job_inputs = rmp_serde::to_vec(&job_inputs).map_err(DbError::value_ser)?;
+        let task_graph_uncompressed = task_graph_json.len() as u64;
+        let serialized_task_graph =
+            zstd::encode_all(task_graph_json.as_bytes(), PAYLOAD_ZSTD_LEVEL)
+                .map_err(|e| DbError::TaskGraphSerializationFailure(Box::new(e)))?;
+        let task_graph_compressed = serialized_task_graph.len() as u64;
+        let job_inputs_msgpack = rmp_serde::to_vec(&job_inputs).map_err(DbError::value_ser)?;
+        let job_inputs_uncompressed = job_inputs_msgpack.len() as u64;
+        let serialized_job_inputs =
+            zstd::encode_all(job_inputs_msgpack.as_slice(), PAYLOAD_ZSTD_LEVEL)
+                .map_err(|e| DbError::ValueSerializationFailure(Box::new(e)))?;
+        let job_inputs_compressed = serialized_job_inputs.len() as u64;
 
         let job_id: JobId = sqlx::query_scalar(INSERT_QUERY)
             .bind(resource_group_id)
@@ -128,7 +140,17 @@ impl ExternalJobOrchestration for MariaDbStorageConnector {
                 }
                 e => e.into(),
             })?;
-        Ok(job_id)
+        Ok(RegisteredJob {
+            job_id,
+            task_graph_bytes: SerializedBytes {
+                uncompressed: task_graph_uncompressed,
+                compressed: task_graph_compressed,
+            },
+            job_inputs_bytes: SerializedBytes {
+                uncompressed: job_inputs_uncompressed,
+                compressed: job_inputs_compressed,
+            },
+        })
     }
 
     async fn get_state(&self, job_id: JobId) -> Result<JobState, DbError> {
@@ -170,8 +192,7 @@ impl ExternalJobOrchestration for MariaDbStorageConnector {
 
         let outputs_bytes = serialized_outputs.ok_or_else(|| {
             DbError::CorruptedDbState(format!(
-                "job `{}` succeeded but has no serialized outputs",
-                job_id.as_uuid_ref()
+                "job `{job_id}` succeeded but has no serialized outputs"
             ))
         })?;
         let outputs: Vec<TaskOutput> =
@@ -201,10 +222,7 @@ impl ExternalJobOrchestration for MariaDbStorageConnector {
         }
 
         let message = error_message.ok_or_else(|| {
-            DbError::CorruptedDbState(format!(
-                "job `{}` failed but has no error message",
-                job_id.as_uuid_ref()
-            ))
+            DbError::CorruptedDbState(format!("job `{job_id}` failed but has no error message"))
         })?;
         Ok(message)
     }
@@ -344,7 +362,7 @@ impl InternalJobOrchestration for MariaDbStorageConnector {
         const DELETE_BATCH_SIZE: usize = 1000;
 
         const SELECT_QUERY: &str = formatcp!(
-            "SELECT CAST(`id` AS BINARY(16)) FROM `{table}` WHERE `state` IN \
+            "SELECT `id` FROM `{table}` WHERE `state` IN \
              ('{succeeded_state}','{failed_state}','{cancelled_state}') AND `ended_at` < NOW() - \
              INTERVAL ? SECOND LIMIT {DELETE_BATCH_SIZE} FOR UPDATE;",
             table = JOBS_TABLE_NAME,
@@ -462,7 +480,7 @@ impl ExecutionManagerLivenessManagement for MariaDbStorageConnector {
         ip_address: IpAddr,
     ) -> Result<ExecutionManagerId, DbError> {
         const INSERT_QUERY: &str = formatcp!(
-            "INSERT INTO `{table}` (`ip_address`) VALUES (?) RETURNING CAST(`id` AS BINARY(16));",
+            "INSERT INTO `{table}` (`ip_address`) VALUES (?) RETURNING `id`;",
             table = EXECUTION_MANAGERS_TABLE_NAME,
         );
 
@@ -539,8 +557,8 @@ impl ExecutionManagerLivenessManagement for MariaDbStorageConnector {
         const UPDATE_BATCH_SIZE: usize = 1000;
 
         const SELECT_QUERY: &str = formatcp!(
-            "SELECT CAST(`id` AS BINARY(16)) FROM `{table}` WHERE `state` = '{alive_state}' AND \
-             `last_heartbeat_at` < CURRENT_TIMESTAMP - INTERVAL ? SECOND FOR UPDATE;",
+            "SELECT `id` FROM `{table}` WHERE `state` = '{alive_state}' AND `last_heartbeat_at` < \
+             CURRENT_TIMESTAMP - INTERVAL ? SECOND FOR UPDATE;",
             table = EXECUTION_MANAGERS_TABLE_NAME,
             alive_state = ExecutionManagerState::Alive.as_str(),
         );
@@ -591,6 +609,9 @@ const JOBS_TABLE_NAME: &str = "jobs";
 const EXECUTION_MANAGERS_TABLE_NAME: &str = "execution_managers";
 const SESSIONS_TABLE_NAME: &str = "sessions";
 
+/// zstd level used to compress both the serialized task graph and the serialized job inputs.
+const PAYLOAD_ZSTD_LEVEL: i32 = 3;
+
 const UPDATE_JOB_STATE: &str = formatcp!(
     "UPDATE `{table}` SET `state` = ? WHERE `id` = ?;",
     table = JOBS_TABLE_NAME,
@@ -615,10 +636,10 @@ const fn jobs_creation_query() -> &'static str {
     formatcp!(
         r"
 CREATE TABLE IF NOT EXISTS `{JOBS_TABLE_NAME}` (
-  `id` UUID NOT NULL DEFAULT UUID_v7(),
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   `resource_group_id` UUID NOT NULL,
   `state` {state_enum} NOT NULL DEFAULT {default_state},
-  `serialized_task_graph` LONGTEXT NOT NULL,
+  `serialized_task_graph` LONGBLOB NOT NULL,
   `serialized_job_inputs` LONGBLOB NOT NULL,
   `serialized_job_outputs` LONGBLOB,
   `error_message` LONGTEXT,
@@ -642,7 +663,7 @@ const fn execution_managers_creation_query() -> &'static str {
     formatcp!(
         r"
 CREATE TABLE IF NOT EXISTS `{EXECUTION_MANAGERS_TABLE_NAME}` (
-  `id` UUID NOT NULL DEFAULT UUID_v7(),
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   `ip_address` VARCHAR(45) NOT NULL,
   `state` {state_enum} NOT NULL DEFAULT {default_state},
   `last_heartbeat_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,

@@ -120,6 +120,25 @@ pub struct RequestLatencySummary {
     pub max_us: u128,
 }
 
+/// Single byte-size observation recorded by the storage service.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RequestSizeSample {
+    pub operation: String,
+    pub bytes: u64,
+}
+
+/// Aggregated byte-size observations for one operation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Tabled)]
+pub struct RequestSizeSummary {
+    pub operation: String,
+    pub count: usize,
+    pub avg_bytes: u64,
+    pub p50_bytes: u64,
+    pub p99_bytes: u64,
+    pub max_bytes: u64,
+    pub total_bytes: u64,
+}
+
 /// Server-side metrics summary for one benchmark session.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ServerMetricsSessionReport {
@@ -128,6 +147,8 @@ pub struct ServerMetricsSessionReport {
     pub elapsed_micros: u128,
     pub request_latency: Vec<RequestLatencySummary>,
     pub low_count_request_latency: Vec<RequestLatencySample>,
+    #[serde(default)]
+    pub request_sizes: Vec<RequestSizeSummary>,
 }
 
 /// In-memory server-side metrics sessions for benchmark runs.
@@ -146,6 +167,7 @@ struct ServerMetricsSession {
     label: Option<String>,
     started_at: Instant,
     samples: Vec<RequestLatencySample>,
+    size_samples: Vec<RequestSizeSample>,
 }
 
 impl ServerMetricsRegistry {
@@ -165,6 +187,7 @@ impl ServerMetricsRegistry {
             label,
             started_at: Instant::now(),
             samples: Vec::new(),
+            size_samples: Vec::new(),
         };
         self.inner
             .sessions
@@ -199,6 +222,7 @@ impl ServerMetricsRegistry {
             elapsed_micros: session.started_at.elapsed().as_micros(),
             request_latency: summarize_requests(&session.samples),
             low_count_request_latency: low_count_samples(&session.samples),
+            request_sizes: summarize_sizes(&session.size_samples),
         })
     }
 
@@ -230,6 +254,30 @@ impl ServerMetricsRegistry {
             .values_mut()
         {
             session.samples.push(sample.clone());
+        }
+    }
+
+    /// Records a byte-size observation into all active sessions.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the metrics session lock is poisoned.
+    pub fn record_size(&self, operation: &'static str, bytes: u64) {
+        if self.inner.active_count.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let sample = RequestSizeSample {
+            operation: operation.to_owned(),
+            bytes,
+        };
+        for session in self
+            .inner
+            .sessions
+            .lock()
+            .expect("server metrics sessions lock should not be poisoned")
+            .values_mut()
+        {
+            session.size_samples.push(sample.clone());
         }
     }
 }
@@ -308,6 +356,53 @@ pub fn summarize_requests(samples: &[RequestLatencySample]) -> Vec<RequestLatenc
             }
         })
         .collect()
+}
+
+/// Aggregates byte-size samples into per-operation rows.
+#[must_use]
+pub fn summarize_sizes(samples: &[RequestSizeSample]) -> Vec<RequestSizeSummary> {
+    let mut operations: Vec<&str> = samples
+        .iter()
+        .map(|sample| sample.operation.as_str())
+        .collect();
+    operations.sort_unstable();
+    operations.dedup();
+
+    operations
+        .into_iter()
+        .map(|operation| {
+            let mut values: Vec<u64> = samples
+                .iter()
+                .filter(|sample| sample.operation == operation)
+                .map(|sample| sample.bytes)
+                .collect();
+            values.sort_unstable();
+            let total: u128 = values.iter().map(|&v| u128::from(v)).sum();
+            let count = values.len();
+            let avg = if count == 0 {
+                0
+            } else {
+                u64::try_from(total / count as u128).unwrap_or(u64::MAX)
+            };
+            RequestSizeSummary {
+                operation: operation.to_owned(),
+                count,
+                avg_bytes: avg,
+                p50_bytes: size_percentile(&values, 50),
+                p99_bytes: size_percentile(&values, 99),
+                max_bytes: values.last().copied().unwrap_or(0),
+                total_bytes: u64::try_from(total).unwrap_or(u64::MAX),
+            }
+        })
+        .collect()
+}
+
+fn size_percentile(sorted_values: &[u64], percentile_value: usize) -> u64 {
+    if sorted_values.is_empty() {
+        return 0;
+    }
+    let index = ((sorted_values.len() - 1) * percentile_value).div_ceil(100);
+    sorted_values[index]
 }
 
 /// Renders the job latency summary as a console table.

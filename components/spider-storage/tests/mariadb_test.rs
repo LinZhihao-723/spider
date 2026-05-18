@@ -67,7 +67,8 @@ async fn test_register_job() {
     let job_id = storage
         .register(rg_id, &job_submission)
         .await
-        .expect("register should succeed");
+        .expect("register should succeed")
+        .job_id;
 
     let state = storage
         .get_state(job_id)
@@ -105,7 +106,8 @@ async fn test_start_job() {
     let job_id = storage
         .register(rg_id, &job_submission)
         .await
-        .expect("register should succeed");
+        .expect("register should succeed")
+        .job_id;
 
     storage.start(job_id).await.expect("start should succeed");
 
@@ -128,7 +130,8 @@ async fn test_start_job_wrong_state() {
     let job_id = storage
         .register(rg_id, &job_submission)
         .await
-        .expect("register should succeed");
+        .expect("register should succeed")
+        .job_id;
 
     storage.start(job_id).await.expect("start should succeed");
 
@@ -151,7 +154,8 @@ async fn test_cancel_job_without_cleanup_transitions_to_cancelled() {
     let job_id = storage
         .register(rg_id, &job_submission)
         .await
-        .expect("register should succeed");
+        .expect("register should succeed")
+        .job_id;
 
     storage.start(job_id).await.expect("start should succeed");
 
@@ -179,7 +183,8 @@ async fn test_get_outputs_succeeded_job() {
     let job_id = storage
         .register(rg_id, &job_submission)
         .await
-        .expect("register should succeed");
+        .expect("register should succeed")
+        .job_id;
 
     storage.start(job_id).await.expect("start should succeed");
 
@@ -207,7 +212,8 @@ async fn test_get_outputs_wrong_state() {
     let job_id = storage
         .register(rg_id, &job_submission)
         .await
-        .expect("register should succeed");
+        .expect("register should succeed")
+        .job_id;
 
     let result = storage.get_outputs(job_id).await;
     assert!(
@@ -228,7 +234,8 @@ async fn test_get_error_failed_job() {
     let job_id = storage
         .register(rg_id, &job_submission)
         .await
-        .expect("register should succeed");
+        .expect("register should succeed")
+        .job_id;
 
     storage.start(job_id).await.expect("start should succeed");
 
@@ -255,7 +262,8 @@ async fn test_get_error_wrong_state() {
     let job_id = storage
         .register(rg_id, &job_submission)
         .await
-        .expect("register should succeed");
+        .expect("register should succeed")
+        .job_id;
 
     let result = storage.get_error(job_id).await;
     assert!(
@@ -276,7 +284,8 @@ async fn test_cancel_job_with_cleanup_transitions_to_cleanup_ready() {
     let job_id = storage
         .register(rg_id, &job_submission)
         .await
-        .expect("register should succeed");
+        .expect("register should succeed")
+        .job_id;
 
     storage.start(job_id).await.expect("start should succeed");
 
@@ -303,7 +312,8 @@ async fn test_cancel_already_terminal() {
     let job_id = storage
         .register(rg_id, &job_submission)
         .await
-        .expect("register should succeed");
+        .expect("register should succeed")
+        .job_id;
 
     storage.start(job_id).await.expect("start should succeed");
 
@@ -333,7 +343,8 @@ async fn test_set_state_valid_transition() {
     let job_id = storage
         .register(rg_id, &job_submission)
         .await
-        .expect("register should succeed");
+        .expect("register should succeed")
+        .job_id;
 
     InternalJobOrchestration::set_state(&storage, job_id, JobState::Running)
         .await
@@ -358,7 +369,8 @@ async fn test_set_state_invalid_transition() {
     let job_id = storage
         .register(rg_id, &job_submission)
         .await
-        .expect("register should succeed");
+        .expect("register should succeed")
+        .job_id;
 
     // Ready -> Succeeded is not a valid transition
     let result = InternalJobOrchestration::set_state(&storage, job_id, JobState::Succeeded).await;
@@ -383,7 +395,8 @@ async fn test_commit_outputs_without_commit_task() {
     let job_id = storage
         .register(rg_id, &job_submission)
         .await
-        .expect("register should succeed");
+        .expect("register should succeed")
+        .job_id;
 
     storage.start(job_id).await.expect("start should succeed");
 
@@ -410,7 +423,8 @@ async fn test_commit_outputs_with_commit_task() {
     let job_id = storage
         .register(rg_id, &job_submission)
         .await
-        .expect("register should succeed");
+        .expect("register should succeed")
+        .job_id;
 
     // Transition to Running via set_state
     InternalJobOrchestration::set_state(&storage, job_id, JobState::Running)
@@ -440,7 +454,8 @@ async fn test_commit_outputs_wrong_state() {
     let job_id = storage
         .register(rg_id, &job_submission)
         .await
-        .expect("register should succeed");
+        .expect("register should succeed")
+        .job_id;
 
     // Job is in Ready state, not Running
     let result =
@@ -466,7 +481,8 @@ async fn test_fail_job() {
     let job_id = storage
         .register(rg_id, &job_submission)
         .await
-        .expect("register should succeed");
+        .expect("register should succeed")
+        .job_id;
 
     storage.start(job_id).await.expect("start should succeed");
 
@@ -493,7 +509,8 @@ async fn test_fail_terminal_state() {
     let job_id = storage
         .register(rg_id, &job_submission)
         .await
-        .expect("register should succeed");
+        .expect("register should succeed")
+        .job_id;
 
     storage.start(job_id).await.expect("start should succeed");
 
@@ -524,7 +541,8 @@ async fn test_delete_expired_terminated_jobs() {
     let job_id = storage
         .register(rg_id, &job_submission)
         .await
-        .expect("register should succeed");
+        .expect("register should succeed")
+        .job_id;
 
     storage.start(job_id).await.expect("start should succeed");
 
@@ -739,7 +757,8 @@ async fn test_cancel_from_ready_state() {
     let job_id = storage
         .register(rg_id, &job_submission)
         .await
-        .expect("register should succeed");
+        .expect("register should succeed")
+        .job_id;
 
     InternalJobOrchestration::cancel(&storage, job_id, false)
         .await
@@ -765,7 +784,8 @@ async fn test_delete_expired_terminated_jobs_no_match() {
     let job_id = storage
         .register(rg_id, &job_submission)
         .await
-        .expect("register should succeed");
+        .expect("register should succeed")
+        .job_id;
 
     storage.start(job_id).await.expect("start should succeed");
 

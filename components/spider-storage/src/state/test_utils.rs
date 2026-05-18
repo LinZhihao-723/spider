@@ -28,7 +28,9 @@ use crate::{
         ExecutionManagerLivenessManagement,
         ExternalJobOrchestration,
         InternalJobOrchestration,
+        RegisteredJob,
         ResourceGroupManagement,
+        SerializedBytes,
         SessionManagement,
     },
     ready_queue::ReadyQueueSender,
@@ -101,10 +103,20 @@ impl ExternalJobOrchestration for MockDbConnector {
         &self,
         _resource_group_id: ResourceGroupId,
         _job_submission: &ValidatedJobSubmission,
-    ) -> Result<JobId, DbError> {
+    ) -> Result<RegisteredJob, DbError> {
         let job_id = JobId::new();
         self.states.insert(job_id, JobState::Ready);
-        Ok(job_id)
+        Ok(RegisteredJob {
+            job_id,
+            task_graph_bytes: SerializedBytes {
+                uncompressed: 0,
+                compressed: 0,
+            },
+            job_inputs_bytes: SerializedBytes {
+                uncompressed: 0,
+                compressed: 0,
+            },
+        })
     }
 
     async fn get_state(&self, job_id: JobId) -> Result<JobState, DbError> {
@@ -216,7 +228,7 @@ impl ExecutionManagerLivenessManagement for MockDbConnector {
         let counter = self
             .next_execution_manager_id
             .fetch_add(1, Ordering::Relaxed);
-        let id = ExecutionManagerId::from(Uuid::from_u64_pair(0, counter as u64));
+        let id = ExecutionManagerId::from(counter as u64);
         self.execution_managers.insert(id, ip_address);
         Ok(id)
     }

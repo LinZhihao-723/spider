@@ -1,16 +1,15 @@
-use std::{net::IpAddr, str::FromStr, time::Duration};
+use std::{fmt::Display, net::IpAddr, str::FromStr, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use spider_core::{
     job::JobState,
     task::{TaskIndex, TdlContext, TimeoutPolicy},
     types::{
-        id::{ExecutionManagerId, Id, JobId, ResourceGroupId, TaskInstanceId},
+        id::{ExecutionManagerId, JobId, ResourceGroupId, TaskInstanceId},
         io::ExecutionContext,
     },
 };
 use spider_storage::{cache::TaskId, ready_queue::ReadyQueueEntry, state::StorageServerError};
-use uuid::Uuid;
 
 /// Result type used by transport-neutral API helpers.
 pub type ApiResult<ResponseType> = Result<ResponseType, ApiError>;
@@ -325,10 +324,8 @@ pub struct ExecutionManagerResponse {
 }
 
 #[must_use]
-pub fn format_id<TypeMarker>(id: &Id<TypeMarker>) -> String
-where
-    TypeMarker: std::fmt::Debug + PartialEq + Eq, {
-    id.as_uuid_ref().to_string()
+pub fn format_id<IdType: Display>(id: &IdType) -> String {
+    id.to_string()
 }
 
 pub(crate) fn parse_resource_group_id(value: &str) -> ApiResult<ResourceGroupId> {
@@ -343,12 +340,11 @@ pub(crate) fn parse_execution_manager_id(value: &str) -> ApiResult<ExecutionMana
     parse_id(value)
 }
 
-fn parse_id<TypeMarker>(value: &str) -> ApiResult<Id<TypeMarker>>
+fn parse_id<IdType>(value: &str) -> ApiResult<IdType>
 where
-    TypeMarker: std::fmt::Debug + PartialEq + Eq, {
-    Uuid::from_str(value)
-        .map(Id::from)
-        .map_err(|e| ApiError::bad_request(format!("invalid UUID `{value}`: {e}")))
+    IdType: FromStr,
+    IdType::Err: Display, {
+    IdType::from_str(value).map_err(|e| ApiError::bad_request(format!("invalid id `{value}`: {e}")))
 }
 
 #[must_use]

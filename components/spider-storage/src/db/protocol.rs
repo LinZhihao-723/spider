@@ -11,6 +11,25 @@ use spider_core::{
 
 use crate::{cache::job_submission::ValidatedJobSubmission, db::error::DbError};
 
+/// Byte counts for a serialized artifact written to the database.
+///
+/// `uncompressed` is the size produced by the underlying serializer (`serde_json` for the task
+/// graph, `rmp_serde` for the job inputs); `compressed` is the size actually persisted in the DB
+/// column after zstd encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SerializedBytes {
+    pub uncompressed: u64,
+    pub compressed: u64,
+}
+
+/// Result of a successful [`ExternalJobOrchestration::register`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegisteredJob {
+    pub job_id: JobId,
+    pub task_graph_bytes: SerializedBytes,
+    pub job_inputs_bytes: SerializedBytes,
+}
+
 /// The database storage interface. A database storage must implement the following traits:
 ///
 /// * [`ExternalJobOrchestration`]
@@ -53,7 +72,7 @@ pub trait ExternalJobOrchestration {
         &self,
         resource_group_id: ResourceGroupId,
         job_submission: &ValidatedJobSubmission,
-    ) -> Result<JobId, DbError>;
+    ) -> Result<RegisteredJob, DbError>;
 
     /// Gets the state of a job.
     ///

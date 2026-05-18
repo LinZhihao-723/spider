@@ -456,7 +456,8 @@ pub fn mariadb_db_connector_factory(
     async move |job_submission: &ValidatedJobSubmission| {
         let job_id = ExternalJobOrchestration::register(&storage, rg_id, job_submission)
             .await
-            .expect("register should succeed");
+            .expect("register should succeed")
+            .job_id;
         (storage, job_id, rg_id)
     }
 }

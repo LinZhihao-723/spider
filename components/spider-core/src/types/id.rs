@@ -1,4 +1,10 @@
-use std::{fmt::Debug, marker::PhantomData};
+use std::{
+    fmt::{self, Debug, Display},
+    marker::PhantomData,
+    num::ParseIntError,
+    str::FromStr,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use serde::{Deserialize, Serialize};
 use sqlx::{Database, encode::IsNull};
@@ -48,6 +54,20 @@ impl<TypeMarker: Debug + PartialEq + Eq> Id<TypeMarker> {
     }
 }
 
+impl<TypeMarker: Debug + PartialEq + Eq> Display for Id<TypeMarker> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Display::fmt(&self.0, f)
+    }
+}
+
+impl<TypeMarker: Debug + PartialEq + Eq> FromStr for Id<TypeMarker> {
+    type Err = uuid::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Uuid::from_str(value).map(Self::from)
+    }
+}
+
 impl<TypeMarker, Db> sqlx::Type<Db> for Id<TypeMarker>
 where
     TypeMarker: Debug + PartialEq + Eq,
@@ -92,6 +112,97 @@ where
 
 pub type UuidBytes = uuid::Bytes;
 
+/// A generic identifier backed by a `u64`, intended for database `BIGINT UNSIGNED
+/// AUTO_INCREMENT` columns.
+///
+/// Same shape as [`Id`], but stored as an 8-byte integer instead of a UUID. The type marker
+/// makes ids of different kinds non-interchangeable at the type level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct IntId<TypeMarker: Debug + PartialEq + Eq>(u64, PhantomData<TypeMarker>);
+
+impl<TypeMarker: Debug + PartialEq + Eq> Default for IntId<TypeMarker> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+static INT_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+impl<TypeMarker: Debug + PartialEq + Eq> IntId<TypeMarker> {
+    /// Returns a fresh in-process id. The DB-side `AUTO_INCREMENT` is the source of truth for
+    /// persisted ids; this is only used for test fixtures or as a placeholder before insertion.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(INT_ID_COUNTER.fetch_add(1, Ordering::Relaxed), PhantomData)
+    }
+
+    #[must_use]
+    pub const fn from(value: u64) -> Self {
+        Self(value, PhantomData)
+    }
+
+    #[must_use]
+    pub const fn as_u64(&self) -> u64 {
+        self.0
+    }
+}
+
+impl<TypeMarker: Debug + PartialEq + Eq> Display for IntId<TypeMarker> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Display::fmt(&self.0, f)
+    }
+}
+
+impl<TypeMarker: Debug + PartialEq + Eq> FromStr for IntId<TypeMarker> {
+    type Err = ParseIntError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        u64::from_str(value).map(Self::from)
+    }
+}
+
+impl<TypeMarker, Db> sqlx::Type<Db> for IntId<TypeMarker>
+where
+    TypeMarker: Debug + PartialEq + Eq,
+    Db: Database,
+    u64: sqlx::Type<Db>,
+{
+    fn type_info() -> <Db as Database>::TypeInfo {
+        <u64 as sqlx::Type<Db>>::type_info()
+    }
+
+    fn compatible(ty: &<Db as Database>::TypeInfo) -> bool {
+        <u64 as sqlx::Type<Db>>::compatible(ty)
+    }
+}
+
+impl<'encode, TypeMarker, Db> sqlx::Encode<'encode, Db> for IntId<TypeMarker>
+where
+    TypeMarker: Debug + PartialEq + Eq,
+    Db: Database,
+    u64: sqlx::Encode<'encode, Db>,
+{
+    fn encode_by_ref(
+        &self,
+        buf: &mut <Db as Database>::ArgumentBuffer<'encode>,
+    ) -> Result<IsNull, sqlx::error::BoxDynError> {
+        self.0.encode_by_ref(buf)
+    }
+}
+
+impl<'decode, TypeMarker, Db> sqlx::Decode<'decode, Db> for IntId<TypeMarker>
+where
+    TypeMarker: Debug + PartialEq + Eq,
+    Db: Database,
+    u64: sqlx::Decode<'decode, Db>,
+{
+    fn decode(
+        value: <Db as Database>::ValueRef<'decode>,
+    ) -> Result<Self, sqlx::error::BoxDynError> {
+        u64::decode(value).map(|v| Self(v, PhantomData))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ResourceGroupIdMarker {}
 pub type ResourceGroupId = Id<ResourceGroupIdMarker>;
@@ -102,7 +213,7 @@ pub type TaskId = Id<TaskIdMarker>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum JobIdMarker {}
-pub type JobId = Id<JobIdMarker>;
+pub type JobId = IntId<JobIdMarker>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DataIdMarker {}
@@ -110,7 +221,7 @@ pub type DataId = Id<DataIdMarker>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ExecutionManagerIdMarker {}
-pub type ExecutionManagerId = Id<ExecutionManagerIdMarker>;
+pub type ExecutionManagerId = IntId<ExecutionManagerIdMarker>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SchedulerIdMarker {}
@@ -130,24 +241,19 @@ pub type TaskInstanceId = u64;
 /// # Type Parameters
 ///
 /// * [`TypeMarker`] - A marker type used to differentiate between different resource types.
-pub struct SignedId<TypeMarker>
-where
-    TypeMarker: Debug + PartialEq + Eq, {
+pub struct SignedId<IdType> {
     signature: ResourceGroupId,
-    id: Id<TypeMarker>,
+    id: IdType,
 }
 
-impl<TypeMarker> SignedId<TypeMarker>
-where
-    TypeMarker: Debug + PartialEq + Eq,
-{
+impl<IdType> SignedId<IdType> {
     /// Factory function.
     ///
     /// # Returns
     ///
     /// A newly created instance of [`SignedId`].
     #[must_use]
-    pub const fn new(signature: ResourceGroupId, id: Id<TypeMarker>) -> Self {
+    pub const fn new(signature: ResourceGroupId, id: IdType) -> Self {
         Self { signature, id }
     }
 
@@ -163,14 +269,14 @@ where
     ///
     /// A reference to the underlying raw ID.
     #[must_use]
-    pub const fn get(&self) -> &Id<TypeMarker> {
+    pub const fn get(&self) -> &IdType {
         &self.id
     }
 }
 
-pub type SignedJobId = SignedId<JobIdMarker>;
+pub type SignedJobId = SignedId<JobId>;
 
-pub type SignedTaskId = SignedId<TaskIdMarker>;
+pub type SignedTaskId = SignedId<TaskId>;
 
 #[cfg(test)]
 mod tests {
@@ -197,5 +303,20 @@ mod tests {
         )
         .expect("JSON deserialization failure");
         assert_eq!(id, deserialized_id);
+    }
+
+    #[test]
+    fn int_id_format_and_parse() {
+        let id = JobId::from(42);
+        assert_eq!(id.to_string(), "42");
+        let parsed: JobId = "42".parse().expect("parse should succeed");
+        assert_eq!(parsed, id);
+    }
+
+    #[test]
+    fn int_id_new_is_monotonic() {
+        let a = JobId::new();
+        let b = JobId::new();
+        assert_ne!(a, b);
     }
 }

@@ -65,6 +65,10 @@ impl StorageApiService {
         let state = state.with_phase_timing_sink(Arc::new(move |operation, latency, succeeded| {
             phase_metrics.record_request(operation, RequestCategory::Phase, latency, succeeded);
         }));
+        let size_metrics = metrics.clone();
+        let state = state.with_byte_size_sink(Arc::new(move |operation, bytes| {
+            size_metrics.record_size(operation, bytes);
+        }));
         Self { state, metrics }
     }
 

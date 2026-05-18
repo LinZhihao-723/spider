@@ -38,7 +38,12 @@ use crate::{
         VerifyResourceGroupRequest,
     },
     client::StorageApiClient,
-    metrics::{RequestLatencySample, RequestLatencySummary, ServerMetricsSessionReport},
+    metrics::{
+        RequestLatencySample,
+        RequestLatencySummary,
+        RequestSizeSummary,
+        ServerMetricsSessionReport,
+    },
     server::StorageApiService,
 };
 
@@ -669,6 +674,11 @@ impl TryFrom<ServerMetricsSessionReport> for proto::ServerMetricsSessionReport {
                 .into_iter()
                 .map(proto::RequestLatencySample::try_from)
                 .collect::<Result<Vec<_>, _>>()?,
+            request_sizes: report
+                .request_sizes
+                .into_iter()
+                .map(proto::RequestSizeSummary::from)
+                .collect(),
         })
     }
 }
@@ -693,6 +703,39 @@ impl From<proto::ServerMetricsSessionReport> for ServerMetricsSessionReport {
                 .into_iter()
                 .map(RequestLatencySample::from)
                 .collect(),
+            request_sizes: report
+                .request_sizes
+                .into_iter()
+                .map(RequestSizeSummary::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<RequestSizeSummary> for proto::RequestSizeSummary {
+    fn from(summary: RequestSizeSummary) -> Self {
+        Self {
+            operation: summary.operation,
+            count: u64::try_from(summary.count).unwrap_or(u64::MAX),
+            avg_bytes: summary.avg_bytes,
+            p50_bytes: summary.p50_bytes,
+            p99_bytes: summary.p99_bytes,
+            max_bytes: summary.max_bytes,
+            total_bytes: summary.total_bytes,
+        }
+    }
+}
+
+impl From<proto::RequestSizeSummary> for RequestSizeSummary {
+    fn from(summary: proto::RequestSizeSummary) -> Self {
+        Self {
+            operation: summary.operation,
+            count: usize::try_from(summary.count).unwrap_or(usize::MAX),
+            avg_bytes: summary.avg_bytes,
+            p50_bytes: summary.p50_bytes,
+            p99_bytes: summary.p99_bytes,
+            max_bytes: summary.max_bytes,
+            total_bytes: summary.total_bytes,
         }
     }
 }

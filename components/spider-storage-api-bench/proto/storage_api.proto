@@ -64,6 +64,7 @@ message ServerMetricsSessionReport {
   uint64 elapsed_micros = 3;
   repeated RequestLatencySummary request_latency = 4;
   repeated RequestLatencySample low_count_request_latency = 5;
+  repeated RequestSizeSummary request_sizes = 6;
 }
 
 message RequestLatencySample {
@@ -71,6 +72,16 @@ message RequestLatencySample {
   string operation = 2;
   uint64 latency_micros = 3;
   bool succeeded = 4;
+}
+
+message RequestSizeSummary {
+  string operation = 1;
+  uint64 count = 2;
+  uint64 avg_bytes = 3;
+  uint64 p50_bytes = 4;
+  uint64 p99_bytes = 5;
+  uint64 max_bytes = 6;
+  uint64 total_bytes = 7;
 }
 
 message AddResourceGroupRequest {

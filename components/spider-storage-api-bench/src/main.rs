@@ -685,6 +685,7 @@ mod tests {
                 elapsed_micros: 1234,
                 request_latency: vec![server_row],
                 low_count_request_latency: Vec::new(),
+                request_sizes: Vec::new(),
             },
         };
 

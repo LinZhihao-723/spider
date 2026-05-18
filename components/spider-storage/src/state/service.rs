@@ -39,6 +39,9 @@ use crate::{
 /// Callback used to record phase-level storage service timings.
 pub type PhaseTimingSink = Arc<dyn Fn(&'static str, Duration, bool) + Send + Sync>;
 
+/// Callback used to record byte-size observations emitted by the storage service.
+pub type ByteSizeSink = Arc<dyn Fn(&'static str, u64) + Send + Sync>;
+
 /// Per-request service state providing access to the storage layer.
 ///
 /// Internally wraps a single [`Arc`] around [`ServiceStateInner`] so that cloning is cheap (one
@@ -59,6 +62,7 @@ pub struct ServiceState<
         ServiceStateInner<ReadyQueueSenderType, DbConnectorType, TaskInstancePoolConnectorType>,
     >,
     phase_timing_sink: Option<PhaseTimingSink>,
+    byte_size_sink: Option<ByteSizeSink>,
 }
 
 impl<
@@ -90,6 +94,7 @@ impl<
                 task_instance_pool_connector,
             }),
             phase_timing_sink: None,
+            byte_size_sink: None,
         }
     }
 
@@ -103,6 +108,21 @@ impl<
         Self {
             inner: self.inner.clone(),
             phase_timing_sink: Some(sink),
+            byte_size_sink: self.byte_size_sink.clone(),
+        }
+    }
+
+    /// Creates a clone of this service state with byte-size emission enabled.
+    ///
+    /// # Returns
+    ///
+    /// A [`ServiceState`] sharing the same storage services and using `sink` for byte-size events.
+    #[must_use]
+    pub fn with_byte_size_sink(&self, sink: ByteSizeSink) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            phase_timing_sink: self.phase_timing_sink.clone(),
+            byte_size_sink: Some(sink),
         }
     }
 
@@ -155,12 +175,29 @@ impl<
         self.record_phase("register_job.validate", started_at, true);
 
         let started_at = Instant::now();
-        let job_id = self
+        let registered = self
             .inner
             .db
             .register(resource_group_id, &job_submission)
             .await?;
         self.record_phase("register_job.db_register", started_at, true);
+        let job_id = registered.job_id;
+        self.record_size(
+            "register_job.task_graph_uncompressed_bytes",
+            registered.task_graph_bytes.uncompressed,
+        );
+        self.record_size(
+            "register_job.task_graph_compressed_bytes",
+            registered.task_graph_bytes.compressed,
+        );
+        self.record_size(
+            "register_job.job_inputs_uncompressed_bytes",
+            registered.job_inputs_bytes.uncompressed,
+        );
+        self.record_size(
+            "register_job.job_inputs_compressed_bytes",
+            registered.job_inputs_bytes.compressed,
+        );
         tracing::info!(
             job_id = ? job_id,
             rg_id = ? resource_group_id,
@@ -660,6 +697,12 @@ impl<
     fn record_phase(&self, operation: &'static str, started_at: Instant, succeeded: bool) {
         if let Some(sink) = &self.phase_timing_sink {
             sink(operation, started_at.elapsed(), succeeded);
+        }
+    }
+
+    fn record_size(&self, operation: &'static str, bytes: u64) {
+        if let Some(sink) = &self.byte_size_sink {
+            sink(operation, bytes);
         }
     }
 
