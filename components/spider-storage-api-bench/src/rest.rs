@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use axum::{
     Json,
     Router,
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -92,8 +92,14 @@ pub(crate) fn router(service: Arc<StorageApiService>) -> Router {
             "/execution-managers/:execution_manager_id/heartbeat",
             post(update_execution_manager_heartbeat),
         )
+        .layer(DefaultBodyLimit::max(REST_MAX_BODY_BYTES))
         .with_state(service)
 }
+
+/// Maximum REST request/response body in bytes. Generous enough to accept the JSON-encoded
+/// `Vec<u8>` task inputs at large `payload_bytes` settings (one raw byte expands to up to ~4 JSON
+/// characters).
+const REST_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {

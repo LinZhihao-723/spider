@@ -15,7 +15,7 @@ max_connections = 32
 [benchmark]
 task_count = 1000
 job_count = 10
-payload_bytes = 128
+payload_bytes = 1024
 client_count = 4
 worker_count = 8
 poll_batch = 64
