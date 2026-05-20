@@ -9,13 +9,10 @@ use spider_core::{
     task::{TaskGraph, TaskIndex},
     types::{
         id::{ExecutionManagerId, JobId, ResourceGroupId, SessionId, TaskInstanceId},
-        io::{ExecutionContext, TaskInput, TaskOutput},
+        io::{ExecutionContext, TaskOutput},
     },
 };
-use spider_tdl::{
-    error::TdlError,
-    wire::{TaskOutputsSerializer, unframe},
-};
+use spider_tdl::{error::TdlError, wire::TaskOutputsSerializer};
 
 use crate::{
     cache::{
@@ -161,17 +158,12 @@ impl<
             TaskGraph::from_json(&serialized_task_graph).map_err(StorageServerError::Task)?;
         self.record_phase("register_job.parse_graph", started_at, true);
 
-        let started_at = Instant::now();
-        let inputs = unframe(&serialized_inputs)
-            .map_err(|e| StorageServerError::Tdl(TdlError::DeserializationError(e.to_string())))?
-            .into_iter()
-            .map(TaskInput::ValuePayload)
-            .collect();
-        self.record_phase("register_job.unframe_inputs", started_at, true);
-
+        // Inputs blob arrives already zstd-compressed (and TDL-framed) from the client. Pass it
+        // through opaque to the DB layer and defer decompression + unframing to JCB build time.
         let started_at = Instant::now();
         let job_submission =
-            ValidatedJobSubmission::create(task_graph, inputs).map_err(CacheError::from)?;
+            ValidatedJobSubmission::create_from_compressed_bytes(task_graph, serialized_inputs)
+                .map_err(CacheError::from)?;
         self.record_phase("register_job.validate", started_at, true);
 
         let started_at = Instant::now();
@@ -874,7 +866,10 @@ mod tests {
         serializer
             .append(TaskInput::ValuePayload(vec![0u8; 4]))
             .expect("input serialization should succeed");
-        (task_graph, serializer.release())
+        let framed = serializer.release();
+        let compressed =
+            zstd::encode_all(framed.as_slice(), 3).expect("zstd compression should succeed");
+        (task_graph, compressed)
     }
 
     fn create_test_serialized_outputs() -> Vec<u8> {
@@ -884,7 +879,8 @@ mod tests {
     }
 
     fn create_empty_serialized_inputs() -> Vec<u8> {
-        spider_tdl::wire::TaskInputsSerializer::new().release()
+        let framed = spider_tdl::wire::TaskInputsSerializer::new().release();
+        zstd::encode_all(framed.as_slice(), 3).expect("zstd compression should succeed")
     }
 
     async fn create_test_jcb(

@@ -163,13 +163,22 @@ fn serialize_job(
     for _ in 0..num_inputs {
         serializer.append(TaskInput::ValuePayload(vec![0; payload_bytes]))?;
     }
+    let framed = serializer.release();
+    // Compress at the client so the server can pass the bytes through to the DB column verbatim
+    // and only pay the decompression cost at JCB build time.
+    let serialized_inputs = zstd::encode_all(framed.as_slice(), INPUTS_ZSTD_LEVEL)?;
     Ok(JobPayload {
         workload_kind,
         serialized_task_graph: graph.to_json()?,
-        serialized_inputs: serializer.release(),
+        serialized_inputs,
         task_count: graph.get_num_tasks(),
     })
 }
+
+/// zstd level used for the client-side compression of the framed inputs blob. Matches the level
+/// the server used to apply to the same payload pre-change so the comparison stays
+/// apples-to-apples.
+const INPUTS_ZSTD_LEVEL: i32 = 3;
 
 fn task_context(task_func: &str) -> TdlContext {
     TdlContext {

@@ -1,28 +1,55 @@
 use spider_core::{task::TaskGraph, types::io::TaskInput};
+use spider_tdl::wire::TaskInputsSerializer;
 
 use super::error::InternalError;
 
-/// A validated wrapper around a task graph and its corresponding job inputs.
+/// zstd compression level used when framing inputs locally via [`ValidatedJobSubmission::create`].
+const INPUTS_ZSTD_LEVEL: i32 = 3;
+
+/// A validated wrapper around a task graph and the corresponding job inputs.
 ///
-/// This type guarantees at construction time that:
+/// Inputs are stored as an opaque zstd-compressed TDL-framed byte blob. Callers feed the blob
+/// straight to the storage layer (which writes it to the DB column verbatim) and only pay the
+/// decompression + unframe cost at JCB build time.
 ///
-/// * The task graph contains at least one task.
-/// * The number of job inputs matches the number of graph inputs expected by the task graph.
+/// At construction time the type guarantees:
 ///
-/// By passing this type through the call chain, downstream consumers can trust the consistency
-/// invariant without re-validating.
+/// * The task graph contains at least one task. The input count is **not** validated here — that
+///   check is deferred to the JCB build path, since the blob is opaque until then.
 #[derive(Debug)]
 pub struct ValidatedJobSubmission {
     task_graph: TaskGraph,
-    inputs: Vec<TaskInput>,
+    inputs_blob: Vec<u8>,
 }
 
 impl ValidatedJobSubmission {
-    /// Creates a new validated job submission.
+    /// Creates a new validated job submission from an already-framed-and-compressed inputs blob.
     ///
-    /// # Returns
+    /// Fast path used by the storage service: the bytes received over the wire are zstd-compressed
+    /// TDL-framed inputs, so we keep them as-is until JCB build time.
     ///
-    /// The validated job submission on success.
+    /// # Errors
+    ///
+    /// Returns [`InternalError::TaskGraphEmpty`] if the task graph contains no tasks.
+    pub fn create_from_compressed_bytes(
+        task_graph: TaskGraph,
+        inputs_blob: Vec<u8>,
+    ) -> Result<Self, InternalError> {
+        if task_graph.get_num_tasks() == 0 {
+            return Err(InternalError::TaskGraphEmpty);
+        }
+        Ok(Self {
+            task_graph,
+            inputs_blob,
+        })
+    }
+
+    /// Creates a new validated job submission from in-memory `TaskInput`s.
+    ///
+    /// Convenience path used by tests and any caller that hasn't already framed and compressed
+    /// the inputs. Validates the input count against the task graph (since the inputs are
+    /// already parsed here), then frames + zstd-compresses them so the on-disk representation
+    /// matches the fast path.
     ///
     /// # Errors
     ///
@@ -44,7 +71,19 @@ impl ValidatedJobSubmission {
                 actual: actual_num_inputs,
             });
         }
-        Ok(Self { task_graph, inputs })
+        let mut serializer = TaskInputsSerializer::new();
+        for input in inputs {
+            serializer
+                .append(input)
+                .map_err(|e| InternalError::TaskGraphCorrupted(e.to_string()))?;
+        }
+        let framed = serializer.release();
+        let inputs_blob = zstd::encode_all(framed.as_slice(), INPUTS_ZSTD_LEVEL)
+            .map_err(|e| InternalError::TaskGraphCorrupted(e.to_string()))?;
+        Ok(Self {
+            task_graph,
+            inputs_blob,
+        })
     }
 
     /// # Returns
@@ -57,20 +96,23 @@ impl ValidatedJobSubmission {
 
     /// # Returns
     ///
-    /// A reference to the validated job inputs.
+    /// A reference to the zstd-compressed TDL-framed inputs blob. Callers writing the blob to
+    /// persistent storage should use this directly; callers needing parsed `TaskInput`s should go
+    /// through [`Self::into_parts`] and decompress.
     #[must_use]
-    pub fn inputs(&self) -> &[TaskInput] {
-        &self.inputs
+    pub fn inputs_blob(&self) -> &[u8] {
+        &self.inputs_blob
     }
 
-    /// Consumes the wrapper and returns the owned task graph and job inputs.
+    /// Consumes the wrapper and returns the owned task graph and inputs blob.
     ///
     /// # Returns
     ///
-    /// A tuple of `(task_graph, inputs)`.
+    /// A tuple of `(task_graph, inputs_blob)`. The blob is still zstd-compressed TDL frames —
+    /// the JCB build path is responsible for decompressing and unframing before use.
     #[must_use]
-    pub fn into_parts(self) -> (TaskGraph, Vec<TaskInput>) {
-        (self.task_graph, self.inputs)
+    pub fn into_parts(self) -> (TaskGraph, Vec<u8>) {
+        (self.task_graph, self.inputs_blob)
     }
 }
 
@@ -87,6 +129,7 @@ mod tests {
         },
         types::io::TaskInput,
     };
+    use spider_tdl::wire::unframe;
 
     use super::{super::error::InternalError, *};
 
@@ -147,13 +190,17 @@ mod tests {
     }
 
     #[test]
-    fn into_parts_returns_owned_components() {
+    fn into_parts_returns_compressed_blob_that_round_trips() {
         let graph = create_single_input_task_graph();
         let inputs = vec![TaskInput::ValuePayload(vec![1u8; 4])];
         let submission =
             ValidatedJobSubmission::create(graph, inputs).expect("submission should be valid");
-        let (graph, inputs) = submission.into_parts();
+        let (graph, inputs_blob) = submission.into_parts();
         assert_eq!(graph.get_num_tasks(), 1, "task graph should have 1 task");
-        assert_eq!(inputs.len(), 1, "should have 1 input");
+
+        let framed = zstd::decode_all(inputs_blob.as_slice()).expect("zstd decode");
+        let payloads = unframe(&framed).expect("unframe");
+        assert_eq!(payloads.len(), 1, "round trip should yield 1 input");
+        assert_eq!(payloads[0].as_slice(), &[1u8; 4]);
     }
 }

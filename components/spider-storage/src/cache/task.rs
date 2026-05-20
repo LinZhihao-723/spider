@@ -8,10 +8,10 @@ use spider_core::{
     task::{Task, TaskIndex, TaskState, TdlContext, TerminationTaskDescriptor, TimeoutPolicy},
     types::{
         id::TaskInstanceId,
-        io::{ExecutionContext, TaskInput, TaskOutput},
+        io::{ExecutionContext, TaskOutput},
     },
 };
-use spider_tdl::wire::TaskInputsSerializer;
+use spider_tdl::wire::{TaskInputsSerializer, unframe};
 use tokio::sync::RwLock;
 
 use crate::cache::{
@@ -51,21 +51,29 @@ impl TaskGraph {
     ///
     /// Panics if the internal TCB buffer is corrupted.
     pub async fn create(job_submission: ValidatedJobSubmission) -> Result<Self, InternalError> {
-        let (submitted_task_graph, inputs) = job_submission.into_parts();
+        let (submitted_task_graph, inputs_blob) = job_submission.into_parts();
+        let framed = zstd::decode_all(inputs_blob.as_slice())
+            .map_err(|e| InternalError::TaskGraphCorrupted(e.to_string()))?;
+        let payloads =
+            unframe(&framed).map_err(|e| InternalError::TaskGraphCorrupted(e.to_string()))?;
+        let task_graph_input_indices = submitted_task_graph.get_task_graph_input_indices();
+        if payloads.len() != task_graph_input_indices.len() {
+            return Err(InternalError::TaskGraphInputSizeMismatch {
+                expected: task_graph_input_indices.len(),
+                actual: payloads.len(),
+            });
+        }
         let dataflow_dep_buffer: Vec<SharedRw<ValuePayload>> = (0..submitted_task_graph
             .get_num_dataflow_deps())
             .map(|_| SharedRw::new(RwLock::new(ValuePayload::default())))
             .collect();
-        let task_graph_input_indices = submitted_task_graph.get_task_graph_input_indices();
-        for (deps_index, input) in task_graph_input_indices.into_iter().zip(inputs) {
+        for (deps_index, payload) in task_graph_input_indices.into_iter().zip(payloads) {
             let dataflow_dep = dataflow_dep_buffer.get(deps_index).ok_or_else(|| {
                 InternalError::TaskGraphCorrupted(
                     "dataflow dependency index out-of-range".to_owned(),
                 )
             })?;
-            *dataflow_dep.write().await = match input {
-                TaskInput::ValuePayload(value) => Some(value),
-            }
+            *dataflow_dep.write().await = Some(payload);
         }
 
         let outputs: Vec<_> = submitted_task_graph
@@ -926,13 +934,16 @@ mod tests {
         },
     };
 
-    use spider_core::task::{
-        DataTypeDescriptor,
-        ExecutionPolicy,
-        TaskDescriptor,
-        TaskGraph as SubmittedTaskGraph,
-        TerminationTaskDescriptor,
-        ValueTypeDescriptor,
+    use spider_core::{
+        task::{
+            DataTypeDescriptor,
+            ExecutionPolicy,
+            TaskDescriptor,
+            TaskGraph as SubmittedTaskGraph,
+            TerminationTaskDescriptor,
+            ValueTypeDescriptor,
+        },
+        types::io::TaskInput,
     };
     use spider_tdl::wire::unframe;
 

@@ -109,7 +109,6 @@ impl ExternalJobOrchestration for MariaDbStorageConnector {
         );
 
         let task_graph = job_submission.task_graph();
-        let job_inputs = job_submission.inputs();
         let task_graph_json = task_graph
             .to_json()
             .map_err(|e| DbError::TaskGraphSerializationFailure(Box::new(e)))?;
@@ -118,17 +117,15 @@ impl ExternalJobOrchestration for MariaDbStorageConnector {
             zstd::encode_all(task_graph_json.as_bytes(), PAYLOAD_ZSTD_LEVEL)
                 .map_err(|e| DbError::TaskGraphSerializationFailure(Box::new(e)))?;
         let task_graph_compressed = serialized_task_graph.len() as u64;
-        let job_inputs_msgpack = rmp_serde::to_vec(&job_inputs).map_err(DbError::value_ser)?;
-        let job_inputs_uncompressed = job_inputs_msgpack.len() as u64;
-        let serialized_job_inputs =
-            zstd::encode_all(job_inputs_msgpack.as_slice(), PAYLOAD_ZSTD_LEVEL)
-                .map_err(|e| DbError::ValueSerializationFailure(Box::new(e)))?;
-        let job_inputs_compressed = serialized_job_inputs.len() as u64;
+        // Inputs blob is already zstd-compressed TDL-framed bytes (produced by the client and
+        // shipped through unchanged). Store as-is — no re-encoding here.
+        let inputs_blob = job_submission.inputs_blob();
+        let job_inputs_compressed = inputs_blob.len() as u64;
 
         let job_id: JobId = sqlx::query_scalar(INSERT_QUERY)
             .bind(resource_group_id)
             .bind(serialized_task_graph)
-            .bind(serialized_job_inputs)
+            .bind(inputs_blob)
             .fetch_one(&self.pool)
             .await
             .map_err(|e| match e {
@@ -146,8 +143,11 @@ impl ExternalJobOrchestration for MariaDbStorageConnector {
                 uncompressed: task_graph_uncompressed,
                 compressed: task_graph_compressed,
             },
+            // Server only sees the compressed blob now; the pre-compressed size is unknown to it.
+            // Report `uncompressed` == `compressed` to make the metric path keep working — the
+            // ratio of 1.0 signals "compressed at the client, passed through verbatim".
             job_inputs_bytes: SerializedBytes {
-                uncompressed: job_inputs_uncompressed,
+                uncompressed: job_inputs_compressed,
                 compressed: job_inputs_compressed,
             },
         })
