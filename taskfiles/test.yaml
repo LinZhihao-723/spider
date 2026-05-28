@@ -38,6 +38,17 @@ tasks:
         vars:
           STORAGE_TASK: "spider-huntsman-unit-tests-executor"
 
+  # Benchmarks the end-to-end latency of `register_execution_manager` under concurrent load.
+  #
+  # Spins up a throwaway MariaDB instance and runs the `em_register_bench` example against it. The
+  # workload can be tuned via the `BENCH_CONCURRENCY`, `BENCH_ITERS_PER_WORKER`, and
+  # `BENCH_WARMUP_PER_WORKER` environment variables (see the example's module docs for defaults).
+  benchmark-em-register:
+    cmds:
+      - task: "huntsman-mariadb-storage-task-executor"
+        vars:
+          STORAGE_TASK: "spider-em-register-bench-executor"
+
   build-unit-test:
     internal: true
     deps:
@@ -255,3 +266,25 @@ tasks:
             echo ""
           fi
         done
+
+  # Internal task that runs the `register_execution_manager` latency benchmark.
+  #
+  # @param {string} MARIADB_PORT The port the MariaDB instance is exposed on.
+  # @param {string} MARIADB_DATABASE The MariaDB database name.
+  # @param {string} MARIADB_USERNAME The MariaDB username.
+  # @param {string} MARIADB_PASSWORD The MariaDB password.
+  spider-em-register-bench-executor:
+    internal: true
+    env:
+      MARIADB_PORT: "{{.MARIADB_PORT}}"
+      MARIADB_DATABASE: "{{.MARIADB_DATABASE}}"
+      MARIADB_USERNAME: "{{.MARIADB_USERNAME}}"
+      MARIADB_PASSWORD: "{{.MARIADB_PASSWORD}}"
+    requires:
+      vars: ["MARIADB_PORT", "MARIADB_DATABASE", "MARIADB_USERNAME", "MARIADB_PASSWORD"]
+    dir: "{{.ROOT_DIR}}"
+    deps: ["toolchains:rust"]
+    cmds:
+      - |-
+        . "{{.G_RUST_TOOLCHAIN_ENV_FILE}}"
+        cargo run --release --package spider-storage --example em_register_bench
