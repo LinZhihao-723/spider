@@ -383,10 +383,18 @@ async fn main() -> anyhow::Result<()> {
     match state {
         JobState::Succeeded => {
             for output_path in &output_paths {
-                let contents = fs::read_to_string(output_path).with_context(|| {
-                    format!("failed to read output file {}", output_path.display())
-                })?;
-                print!("{contents}");
+                // A task with no matching records writes no output file, so a missing file means
+                // "no results" rather than an error.
+                match fs::read_to_string(output_path) {
+                    Ok(contents) => print!("{contents}"),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(anyhow::Error::new(error).context(format!(
+                            "failed to read output file {}",
+                            output_path.display()
+                        )));
+                    }
+                }
             }
         }
         JobState::Failed => {

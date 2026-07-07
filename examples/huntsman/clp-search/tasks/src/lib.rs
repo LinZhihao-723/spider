@@ -1,21 +1,41 @@
-//! TDL package that runs KQL searches over CLP archives via the `clp-s` binary.
+//! TDL package that runs KQL searches over CLP archives via the `clp-s` C-API library.
 
 mod task_decl {
     use std::{
-        env,
-        fs::File,
-        process::{Command, Stdio},
+        ffi::{CStr, CString},
+        fs,
+        os::raw::{c_char, c_int, c_void},
         sync::Once,
         time::Instant,
     };
 
     use spider_tdl::{TaskContext, TdlError, task};
 
-    /// Environment variable that overrides the `clp-s` binary path.
-    const CLP_S_BIN_ENV: &str = "CLP_S_BIN";
+    // FFI to `libclp-s.so` (linked via `build.rs`).
+    unsafe extern "C" {
+        /// Searches the single clp-s archive at `archive_path` with the KQL `query`, invoking
+        /// `callback` once per matching record. Returns 0 on success, non-zero on failure.
+        fn clp_s_search_archive(
+            archive_path: *const c_char,
+            query: *const c_char,
+            callback: Option<unsafe extern "C" fn(*const c_char, *mut c_void)>,
+            user_data: *mut c_void,
+        ) -> c_int;
+    }
 
-    /// Default `clp-s` binary path used when [`CLP_S_BIN_ENV`] is unset.
-    const DEFAULT_CLP_S_BIN: &str = "/home/lzh/dev/clp/build/core/clp-s";
+    /// C-ABI result callback: appends a matching record's JSON to the caller's result buffer.
+    ///
+    /// `user_data` is the `*mut Vec<u8>` passed to [`clp_s_search_archive`]. `message` is a
+    /// NUL-terminated JSON record that already ends with a newline, so it is appended verbatim (no
+    /// extra separator). `clp_s_search_archive` invokes this serially for a single archive, so the
+    /// unsynchronized append is sound.
+    unsafe extern "C" fn append_result(message: *const c_char, user_data: *mut c_void) {
+        if message.is_null() || user_data.is_null() {
+            return;
+        }
+        let buffer = unsafe { &mut *user_data.cast::<Vec<u8>>() };
+        buffer.extend_from_slice(unsafe { CStr::from_ptr(message) }.to_bytes());
+    }
 
     /// Guards one-time installation of this package's tracing subscriber.
     static LOG_INIT: Once = Once::new();
@@ -39,21 +59,18 @@ mod task_decl {
         });
     }
 
-    /// Runs the KQL `query` over the CLP archive at `archive_path`, writing the matching records as
-    /// JSONL to `output_path`.
+    /// Runs the KQL `query` over the CLP archive at `archive_path` via the `clp-s` C-API, buffering
+    /// matching records in memory and writing them as JSONL to `output_path`.
     ///
-    /// Invokes the `clp-s` binary (resolved from the `CLP_S_BIN` environment variable, or
-    /// [`DEFAULT_CLP_S_BIN`] when unset) as `clp-s s <archive_path> <query>` and redirects its
-    /// stdout into the freshly truncated file at `output_path`. The parent directory of
-    /// `output_path` is assumed to already exist.
+    /// The buffered results are written to `output_path` only when at least one record matched; an
+    /// empty result set produces no output file.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     ///
-    /// * [`TdlError::ExecutionError`] if the output file cannot be created, the `clp-s` process
-    ///   cannot be spawned, the process cannot be waited on, or the process exits with a
-    ///   non-success status.
+    /// * [`TdlError::ExecutionError`] if `archive_path` or `query` contains an interior NUL byte,
+    ///   the `clp_s_search_archive` call reports a failure, or the output file cannot be written.
     #[task(name = "clp_search::search")]
     pub fn search(
         ctx: TaskContext,
@@ -62,46 +79,51 @@ mod task_decl {
         output_path: String,
     ) -> Result<(), TdlError> {
         init_task_logging();
-        let clp_s_bin = env::var(CLP_S_BIN_ENV).unwrap_or_else(|_| DEFAULT_CLP_S_BIN.to_owned());
 
-        let output_file = File::create(&output_path).map_err(|error| {
-            TdlError::ExecutionError(format!(
-                "failed to create output file `{output_path}` for archive `{archive_path}`: \
-                 {error}"
-            ))
+        let archive_path_c = CString::new(archive_path.as_str()).map_err(|error| {
+            TdlError::ExecutionError(format!("archive path `{archive_path}` contains a NUL: {error}"))
+        })?;
+        let query_c = CString::new(query.as_str()).map_err(|error| {
+            TdlError::ExecutionError(format!("query `{query}` contains a NUL: {error}"))
         })?;
 
-        // Benchmark instrumentation: time only the `clp-s` subprocess.
+        // Benchmark instrumentation: time only the `clp-s` library search.
+        let mut results: Vec<u8> = Vec::new();
         let clp_s_start = Instant::now();
-        let output = Command::new(&clp_s_bin)
-            .arg("s")
-            .arg(&archive_path)
-            .arg(&query)
-            .stdout(Stdio::from(output_file))
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|error| {
-                TdlError::ExecutionError(format!(
-                    "failed to run `{clp_s_bin}` for archive `{archive_path}`: {error}"
-                ))
-            })?;
+        let return_code = unsafe {
+            clp_s_search_archive(
+                archive_path_c.as_ptr(),
+                query_c.as_ptr(),
+                Some(append_result),
+                (&raw mut results).cast(),
+            )
+        };
         let clp_s_elapsed_us = u64::try_from(clp_s_start.elapsed().as_micros()).unwrap_or(u64::MAX);
         tracing::info!(
             clp_s_elapsed_us,
             job_id = ? ctx.job_id,
             task_id = ? ctx.task_id,
-            "clp-s subprocess finished."
+            "clp-s library search finished."
         );
 
-        if output.status.success() {
+        if return_code != 0 {
+            return Err(TdlError::ExecutionError(format!(
+                "`clp_s_search_archive` failed (return code {return_code}) for archive \
+                 `{archive_path}`"
+            )));
+        }
+
+        // No matches -> no output file, per the task contract.
+        if results.is_empty() {
             return Ok(());
         }
 
-        Err(TdlError::ExecutionError(format!(
-            "`clp-s` failed for archive `{archive_path}` with status {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr),
-        )))
+        fs::write(&output_path, &results).map_err(|error| {
+            TdlError::ExecutionError(format!(
+                "failed to write output file `{output_path}` for archive `{archive_path}`: {error}"
+            ))
+        })?;
+        Ok(())
     }
 }
 

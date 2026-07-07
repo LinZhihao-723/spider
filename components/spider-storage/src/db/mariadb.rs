@@ -591,37 +591,71 @@ impl ExecutionManagerLivenessManagement for MariaDbStorageConnector {
     ) -> Result<Vec<ExecutionManagerId>, DbError> {
         const UPDATE_BATCH_SIZE: usize = 1000;
 
-        const SELECT_QUERY: &str = formatcp!(
+        // Find stale execution managers with a NON-LOCKING secondary-index scan. Taking no locks
+        // here (unlike a `... FOR UPDATE`) is what avoids the deadlock with
+        // `update_execution_manager_heartbeat`: that path locks the primary-key row first and then
+        // the `execution_manager_liveness (state, last_heartbeat_at)` secondary index, so a
+        // `FOR UPDATE` scan that locked the secondary index first would invert the lock order.
+        const SCAN_QUERY: &str = formatcp!(
             "SELECT `id` FROM `{table}` WHERE `state` = '{alive_state}' AND `last_heartbeat_at` < \
-             CURRENT_TIMESTAMP - INTERVAL ? SECOND FOR UPDATE;",
+             CURRENT_TIMESTAMP - INTERVAL ? SECOND ORDER BY `id`;",
             table = EXECUTION_MANAGERS_TABLE_NAME,
             alive_state = ExecutionManagerState::Alive.as_str(),
         );
 
-        let mut tx = self.pool.begin().await?;
-        let execution_manager_ids: Vec<ExecutionManagerId> = sqlx::query_scalar(SELECT_QUERY)
+        let candidate_ids: Vec<ExecutionManagerId> = sqlx::query_scalar(SCAN_QUERY)
             .bind(stale_after_sec)
-            .fetch_all(&mut *tx)
+            .fetch_all(&self.pool)
             .await?;
+        if candidate_ids.is_empty() {
+            return Ok(Vec::new());
+        }
 
-        for execution_manager_id_batch in execution_manager_ids.chunks(UPDATE_BATCH_SIZE) {
-            let placeholders = std::iter::repeat_n("?", execution_manager_id_batch.len())
+        let mut tx = self.pool.begin().await?;
+        let mut dead_execution_manager_ids = Vec::new();
+        for candidate_batch in candidate_ids.chunks(UPDATE_BATCH_SIZE) {
+            let placeholders = std::iter::repeat_n("?", candidate_batch.len())
+                .collect::<Vec<_>>()
+                .join(",");
+
+            // Lock the candidate rows by PRIMARY key (the same lock order as the heartbeat path)
+            // and re-check liveness, so an execution manager that heartbeated between the scan and
+            // the lock is not marked dead.
+            let lock_query = format!(
+                "SELECT `id` FROM `{EXECUTION_MANAGERS_TABLE_NAME}` FORCE INDEX (PRIMARY) WHERE \
+                 `id` IN ({placeholders}) AND `state` = '{alive_state}' AND `last_heartbeat_at` < \
+                 CURRENT_TIMESTAMP - INTERVAL ? SECOND ORDER BY `id` FOR UPDATE;",
+                alive_state = ExecutionManagerState::Alive.as_str(),
+            );
+            let mut lock_stmt = sqlx::query_scalar::<_, ExecutionManagerId>(&lock_query);
+            for execution_manager_id in candidate_batch {
+                lock_stmt = lock_stmt.bind(execution_manager_id);
+            }
+            lock_stmt = lock_stmt.bind(stale_after_sec);
+            let locked_ids: Vec<ExecutionManagerId> = lock_stmt.fetch_all(&mut *tx).await?;
+            if locked_ids.is_empty() {
+                continue;
+            }
+
+            let update_placeholders = std::iter::repeat_n("?", locked_ids.len())
                 .collect::<Vec<_>>()
                 .join(",");
             let update_query = format!(
                 "UPDATE `{EXECUTION_MANAGERS_TABLE_NAME}` SET `state` = '{dead_state}', \
-                 `death_confirmed_at` = CURRENT_TIMESTAMP WHERE `id` IN ({placeholders})",
+                 `death_confirmed_at` = CURRENT_TIMESTAMP WHERE `id` IN ({update_placeholders});",
                 dead_state = ExecutionManagerState::Dead.as_str(),
             );
-            let mut query = sqlx::query(&update_query);
-            for execution_manager_id in execution_manager_id_batch {
-                query = query.bind(execution_manager_id);
+            let mut update_stmt = sqlx::query(&update_query);
+            for execution_manager_id in &locked_ids {
+                update_stmt = update_stmt.bind(execution_manager_id);
             }
-            query.execute(&mut *tx).await?;
+            update_stmt.execute(&mut *tx).await?;
+
+            dead_execution_manager_ids.extend(locked_ids);
         }
 
         tx.commit().await?;
-        Ok(execution_manager_ids)
+        Ok(dead_execution_manager_ids)
     }
 }
 
