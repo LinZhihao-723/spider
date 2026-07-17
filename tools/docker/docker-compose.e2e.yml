@@ -40,6 +40,11 @@ services:
       MYSQL_USER: spider-user
       MYSQL_PASSWORD: spider-password
       MYSQL_ROOT_PASSWORD: spider-root-password
+    # Publish on host 3307 (not 3306) so the CLP metadata DB container can keep host 3306. The
+    # storage service still connects internally at the bridge IP 172.40.0.20:3306 (unchanged), so no
+    # generated config needs updating -- this mapping only affects host-side access.
+    ports:
+      - "3307:3306"
     # The storage service connects to this container's bridge IP (172.40.0.20:3306, set in
     # spider-compose.yaml). MariaDB binds 0.0.0.0 by default, so it is reachable at that IP.
     healthcheck:
@@ -58,6 +63,10 @@ services:
     networks:
       spider_net:
         ipv4_address: 172.40.0.30
+    # Publish the storage gRPC endpoint on the host so a host-side driver (e.g. the CLP e2e harness)
+    # can reach it at 127.0.0.1:50051; in-cluster clients still use the bridge IP 172.40.0.30:50051.
+    ports:
+      - "50051:50051"
     depends_on:
       mariadb:
         condition: service_healthy
@@ -136,6 +145,14 @@ services:
   worker-3:
     <<: *worker
   worker-4:
+    <<: *worker
+  worker-5:
+    <<: *worker
+  worker-6:
+    <<: *worker
+  worker-7:
+    <<: *worker
+  worker-8:
     <<: *worker
 
 # User-defined bridge network with static IPv4 addresses for the services that are connect

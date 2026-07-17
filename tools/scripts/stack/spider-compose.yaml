@@ -29,7 +29,7 @@
 # for clarity; the compose file defines the actual worker services. Each worker reuses the same
 # generated EM config -- the storage service assigns each a fresh ExecutionManagerId on
 # registration, so identical configs do not collide.
-workers: 4
+workers: 8
 
 # Log level for every Rust service in the stack. Forwarded to each binary as RUST_LOG via the
 # compose `environment`.
