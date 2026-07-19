@@ -45,7 +45,7 @@ impl Default for RetryConfig {
 /// * `ResponseType` - The success value produced by `grpc_call`.
 /// * `ErrorType` - The error produced by `grpc_call`.
 /// * `GrpcCall` - The closure performing the gRPC call.
-/// * `Fut` - The `Send` future returned by `grpc_call`.
+/// * `FutureType` - The `Send` future returned by `grpc_call`.
 /// * `RetriableCheck` - Classifies an error as retriable or not.
 ///
 /// # Returns
@@ -62,8 +62,8 @@ impl Default for RetryConfig {
 pub async fn execute_with_retry<
     ResponseType,
     ErrorType,
-    GrpcCall: FnMut() -> Fut,
-    Fut: Future<Output = Result<ResponseType, ErrorType>> + Send,
+    GrpcCall: FnMut() -> FutureType,
+    FutureType: Future<Output = Result<ResponseType, ErrorType>> + Send,
     RetriableCheck: Fn(&ErrorType) -> bool,
 >(
     max_retries: usize,
@@ -92,7 +92,7 @@ pub async fn execute_with_retry<
 ///
 /// * `ResponseType` - The success value produced by `grpc_call`.
 /// * `GrpcCall` - The closure performing the gRPC round-trip.
-/// * `Fut` - The `Send` future returned by `grpc_call`.
+/// * `FutureType` - The `Send` future returned by `grpc_call`.
 ///
 /// # Returns
 ///
@@ -106,8 +106,8 @@ pub async fn execute_with_retry<
 ///   budget is exhausted.
 pub async fn call_with_retry<
     ResponseType,
-    GrpcCall: FnMut() -> Fut,
-    Fut: Future<Output = Result<ResponseType, Status>> + Send,
+    GrpcCall: FnMut() -> FutureType,
+    FutureType: Future<Output = Result<ResponseType, Status>> + Send,
 >(
     retry_config: RetryConfig,
     grpc_call: GrpcCall,

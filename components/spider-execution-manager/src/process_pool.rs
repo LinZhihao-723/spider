@@ -407,8 +407,8 @@ fn build_request(request: ExecuteRequest) -> Result<Request, InternalError> {
     } = ctx;
     let (raw_inputs, serialized_task_graph_outputs) = if task_id == TaskId::Commit {
         // A commit task takes no value-params, but the executor still unframes `raw_inputs` as a
-        // wire-format stream. It must therefore be a valid empty frame (a zero-count header), not an
-        // empty byte buffer, which would fail to unframe.
+        // wire-format stream. Therefore, it must be a valid empty frame (a zero-count header), not
+        // an empty byte buffer.
         (
             spider_core::types::io::TaskInputsSerializer::new().release(),
             Some(serialized_task_io),
@@ -480,7 +480,10 @@ mod tests {
             panic!("build_request must produce a Request::Execute");
         };
 
-        assert!(raw_inputs.is_empty());
+        assert_eq!(
+            raw_inputs,
+            spider_core::types::io::TaskInputsSerializer::new().release()
+        );
         let ctx: TaskContext = rmp_serde::from_slice(&raw_ctx)?;
         assert_eq!(ctx.get_task_graph_outputs()?, Some(outputs));
         Ok(())
@@ -506,7 +509,10 @@ mod tests {
             panic!("build_request must produce a Request::Execute");
         };
 
-        assert!(raw_inputs.is_empty());
+        assert_eq!(
+            raw_inputs,
+            spider_core::types::io::TaskInputsSerializer::new().release()
+        );
         let ctx: TaskContext = rmp_serde::from_slice(&raw_ctx)?;
         assert_eq!(ctx.get_task_graph_outputs()?, Some(Vec::new()));
         Ok(())
