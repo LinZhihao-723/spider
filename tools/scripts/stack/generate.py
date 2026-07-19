@@ -117,8 +117,10 @@ def _build_scheduler_config(config: dict) -> dict:
     scheduler_endpoint = config["scheduler_endpoint"]
     out_runtime: dict = {
         "scheduler": _RoundRobin(_require(runtime, "scheduler", "scheduler.runtime")),
-        "host": _require(scheduler_endpoint, "host", "scheduler_endpoint"),
-        "port": _require(scheduler_endpoint, "port", "scheduler_endpoint"),
+        "advertised_endpoint": {
+            "host": _require(scheduler_endpoint, "host", "scheduler_endpoint"),
+            "port": _require(scheduler_endpoint, "port", "scheduler_endpoint"),
+        },
     }
     # em_registry and stop_timeout_sec have #[serde(default)]; only emit if set.
     if "em_registry" in runtime:
@@ -126,6 +128,8 @@ def _build_scheduler_config(config: dict) -> dict:
     if "stop_timeout_sec" in runtime:
         out_runtime["stop_timeout_sec"] = runtime["stop_timeout_sec"]
     return {
+        "host": _require(scheduler_endpoint, "host", "scheduler_endpoint"),
+        "port": _require(scheduler_endpoint, "port", "scheduler_endpoint"),
         "storage_endpoint": {
             "host": _require(storage_endpoint, "host", "storage_endpoint"),
             "port": _require(storage_endpoint, "port", "storage_endpoint"),
