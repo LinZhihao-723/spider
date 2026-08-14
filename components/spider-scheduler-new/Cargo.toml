@@ -1,0 +1,32 @@
+[package]
+name = "spider-scheduler-new"
+version = { workspace = true }
+edition = { workspace = true }
+
+[lib]
+name = "spider_scheduler_new"
+path = "src/lib.rs"
+
+[dependencies]
+async-channel = { workspace = true }
+async-trait = { workspace = true }
+dashmap = { workspace = true }
+prost = { workspace = true }
+serde = { workspace = true }
+spider-core = { workspace = true }
+thiserror = { workspace = true }
+tokio = {
+  workspace = true,
+  features = ["macros", "net", "rt", "rt-multi-thread", "sync", "time"]
+}
+tokio-util = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+tracing = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

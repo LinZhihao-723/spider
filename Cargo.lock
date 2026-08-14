@@ -2040,6 +2040,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "spider-scheduler-new"
+version = "0.1.0-dev"
+dependencies = [
+ "anyhow",
+ "async-channel",
+ "async-trait",
+ "dashmap",
+ "prost",
+ "serde",
+ "spider-core",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tracing",
+]
+
+[[package]]
 name = "spider-storage"
 version = "0.1.0-dev"
 dependencies = [

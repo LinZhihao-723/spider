@@ -7,6 +7,7 @@ members = [
   "components/spider-execution-manager",
   "components/spider-proto-rust",
   "components/spider-scheduler",
+  "components/spider-scheduler-new",
   "components/spider-storage",
   "components/spider-task-executor",
   "components/spider-tdl",
@@ -30,6 +31,7 @@ default-members = [
   "components/spider-execution-manager",
   "components/spider-proto-rust",
   "components/spider-scheduler",
+  "components/spider-scheduler-new",
   "components/spider-storage",
   "components/spider-task-executor",
   "components/spider-tdl",
@@ -72,6 +74,7 @@ spider-core = { path = "components/spider-core" }
 spider-derive = { path = "components/spider-derive" }
 spider-execution-manager = { path = "components/spider-execution-manager" }
 spider-proto-rust = { path = "components/spider-proto-rust" }
+spider-scheduler-new = { path = "components/spider-scheduler-new" }
 spider-task-executor = { path = "components/spider-task-executor" }
 spider-tdl = { path = "components/spider-tdl" }
 spider-tdl-derive = { path = "components/spider-tdl-derive" }

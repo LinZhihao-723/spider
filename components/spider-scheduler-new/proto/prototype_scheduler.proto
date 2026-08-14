@@ -1,0 +1,44 @@
+syntax = "proto3";
+package prototype_scheduler;
+
+service PrototypeSchedulerService {
+  rpc NextTask(NextTaskRequest) returns (NextTaskResponse);
+}
+
+message Void {}
+
+message TaskId {
+  oneof kind {
+    uint64 index = 1;
+    Void commit = 2;
+    Void cleanup = 3;
+  }
+}
+
+message CompletedAssignment {
+  uint64 job_id = 1;
+  TaskId task_id = 2;
+}
+
+message NextTaskRequest {
+  uint64 execution_manager_id = 1;
+  // Absent for a general execution manager; present for one pinned to a resource group.
+  optional uint64 resource_group_id = 2;
+  uint64 wait_time_ms = 3;
+  optional CompletedAssignment completed = 4;
+}
+
+message Assignment {
+  uint64 id = 1;
+  uint64 resource_group_id = 2;
+  uint64 job_id = 3;
+  TaskId task_id = 4;
+  uint64 session_id = 5;
+}
+
+message NextTaskResponse {
+  oneof result {
+    Assignment assignment = 1;
+    Void no_task = 2;
+  }
+}
