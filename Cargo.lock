@@ -2046,9 +2046,11 @@ dependencies = [
  "anyhow",
  "async-channel",
  "async-trait",
+ "clap",
  "dashmap",
  "prost",
  "serde",
+ "serde_json",
  "spider-core",
  "thiserror",
  "tokio",
@@ -2057,6 +2059,7 @@ dependencies = [
  "tonic-prost",
  "tonic-prost-build",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -50,6 +50,19 @@ impl RgDispatchQueueReader {
         &self.0.living_hint
     }
 
+    /// Attempts a single non-blocking pop.
+    ///
+    /// Used by a pinned execution manager to learn whether an assignment is already waiting for it,
+    /// which is what tells a request that only cost a dispatch apart from one that had to wait for
+    /// work to exist. Like [`Self::recv_pinned`], it leaves the hint counter untouched.
+    ///
+    /// # Returns
+    ///
+    /// The next assignment, or [`None`] if the queue is empty or closed.
+    pub(crate) fn try_recv_pinned(&self) -> Option<TaskAssignment> {
+        self.0.receiver.try_recv().ok()
+    }
+
     /// Blocks until an assignment arrives or `wait_time` expires.
     ///
     /// Used by a pinned execution manager, which is steered by nothing but this queue and therefore

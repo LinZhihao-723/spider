@@ -47,6 +47,15 @@ impl GlobalDispatchQueue {
         self.sender.try_send(reader).is_ok()
     }
 
+    /// Attempts a single non-blocking hint pop.
+    ///
+    /// # Returns
+    ///
+    /// The next hint, or [`None`] if no hint is outstanding or the channel was closed.
+    pub(crate) fn try_recv(&self) -> Option<RgDispatchQueueReader> {
+        self.receiver.try_recv().ok()
+    }
+
     /// Blocks until a hint arrives or `wait_time` expires.
     ///
     /// # Returns
@@ -76,6 +85,52 @@ impl GlobalDispatchQueue {
 impl Default for GlobalDispatchQueue {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// What one dispatch request was served, together with the class it falls into.
+///
+/// The class is what separates the scheduler's own cost from the supply of work: only an immediate
+/// request measures how long the scheduler took to hand an assignment over, while a waited one is
+/// dominated by how long the request had to wait for an assignment to exist at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DispatchOutcome {
+    /// An assignment was already available, and was served without the request ever awaiting on an
+    /// empty queue.
+    Immediate(TaskAssignment),
+
+    /// The request awaited on an empty queue, and an assignment arrived before its wait expired.
+    Waited(TaskAssignment),
+
+    /// No assignment arrived before the request's wait expired.
+    Empty,
+}
+
+impl DispatchOutcome {
+    /// Factory function.
+    ///
+    /// # Returns
+    ///
+    /// A newly created outcome carrying `assignment`, classified as waited if the request awaited
+    /// on an empty queue at any point before it was served.
+    #[must_use]
+    pub const fn served(assignment: TaskAssignment, waited: bool) -> Self {
+        if waited {
+            Self::Waited(assignment)
+        } else {
+            Self::Immediate(assignment)
+        }
+    }
+
+    /// # Returns
+    ///
+    /// The assignment served, or [`None`] if the request was served none.
+    #[must_use]
+    pub const fn into_assignment(self) -> Option<TaskAssignment> {
+        match self {
+            Self::Immediate(assignment) | Self::Waited(assignment) => Some(assignment),
+            Self::Empty => None,
+        }
     }
 }
 
@@ -116,7 +171,30 @@ impl DispatchService {
         rg_id: ResourceGroupId,
         wait_time: Duration,
     ) -> Option<TaskAssignment> {
+        self.next_task_pinned_classified(rg_id, wait_time)
+            .await
+            .into_assignment()
+    }
+
+    /// Serves an execution manager pinned to `rg_id`, reporting which class the request fell into.
+    ///
+    /// The class is an observation of the path [`Self::next_task_pinned`] already takes rather than
+    /// a second path: a non-blocking pop precedes every wait, so the wait is entered only once the
+    /// queue has been seen empty, and neither how long the request is willing to wait nor what it
+    /// returns changes. A retry that follows a stale-session assignment carries whatever the
+    /// request has already waited on, so having waited once makes the whole request a waited one.
+    ///
+    /// # Returns
+    ///
+    /// The next assignment of `rg_id` and its class, or [`DispatchOutcome::Empty`] if none became
+    /// available within `wait_time`.
+    pub async fn next_task_pinned_classified(
+        &self,
+        rg_id: ResourceGroupId,
+        wait_time: Duration,
+    ) -> DispatchOutcome {
         let deadline = tokio::time::Instant::now() + wait_time;
+        let mut waited = false;
         loop {
             // Re-fetched per attempt because a retry follows a stale-session assignment, which is
             // evidence of a bump: reusing the reader would serve from a table entry the bump has
@@ -125,10 +203,18 @@ impl DispatchService {
             let reader = self
                 .rg_table
                 .get_dispatch_queue_reader(rg_id, self.session_manager.current());
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let assignment = reader.recv_pinned(remaining).await?;
+            let mut served = reader.try_recv_pinned();
+            if served.is_none() {
+                waited = true;
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                served = reader.recv_pinned(remaining).await;
+            }
+            let Some(assignment) = served else {
+                return DispatchOutcome::Empty;
+            };
+
             if assignment.session_id == self.session_manager.current() {
-                return Some(assignment);
+                return DispatchOutcome::served(assignment, waited);
             }
         }
     }
@@ -140,10 +226,35 @@ impl DispatchService {
     /// The next assignment of any resource group, or [`None`] if none became available within
     /// `wait_time`.
     pub async fn next_task_general(&self, wait_time: Duration) -> Option<TaskAssignment> {
+        self.next_task_general_classified(wait_time)
+            .await
+            .into_assignment()
+    }
+
+    /// Serves a general execution manager, reporting which class the request fell into.
+    ///
+    /// As on the pinned path, the class is an observation rather than a second path: a non-blocking
+    /// hint pop precedes every wait on the hint channel. Traversing stale hints costs nothing but
+    /// pops, so a request that discards several of them without ever finding the channel empty is
+    /// still an immediate one.
+    ///
+    /// # Returns
+    ///
+    /// The next assignment of any resource group and its class, or [`DispatchOutcome::Empty`] if
+    /// none became available within `wait_time`.
+    pub async fn next_task_general_classified(&self, wait_time: Duration) -> DispatchOutcome {
         let deadline = tokio::time::Instant::now() + wait_time;
+        let mut waited = false;
         loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let reader = self.global_queue.recv(remaining).await?;
+            let mut hint = self.global_queue.try_recv();
+            if hint.is_none() {
+                waited = true;
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                hint = self.global_queue.recv(remaining).await;
+            }
+            let Some(reader) = hint else {
+                return DispatchOutcome::Empty;
+            };
 
             // No await point may separate the receive above from the decrement inside
             // `consume_hint_and_try_recv`: a future can only be dropped at an await, so this is
@@ -163,7 +274,7 @@ impl DispatchService {
             };
 
             if assignment.session_id == current_session_id {
-                return Some(assignment);
+                return DispatchOutcome::served(assignment, waited);
             }
         }
     }

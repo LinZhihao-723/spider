@@ -5,6 +5,13 @@ service PrototypeSchedulerService {
   rpc NextTask(NextTaskRequest) returns (NextTaskResponse);
 }
 
+// The benchmark's coordination service, served alongside the dispatch service by the bench
+// scheduler binary. It is a separate service so that the dispatch service a correctness run brings
+// up stays exactly what a deployed scheduler exposes.
+service PrototypeBenchService {
+  rpc RunStatus(RunStatusRequest) returns (RunStatusResponse);
+}
+
 message Void {}
 
 message TaskId {
@@ -36,9 +43,33 @@ message Assignment {
   uint64 session_id = 5;
 }
 
+// How the scheduler served a `NextTask` request. It is reported back so that a client-side latency
+// sample is filed into the same class as the server-side sample of the very same request, which is
+// what keeps the two sides comparable.
+enum DispatchClass {
+  // The class is absent, which is what a peer speaking an older schema reports.
+  DISPATCH_CLASS_UNSPECIFIED = 0;
+  // An assignment was available when the request was received, and was returned without the
+  // handler ever awaiting on an empty queue.
+  DISPATCH_CLASS_IMMEDIATE = 1;
+  // The handler awaited on an empty queue until an assignment arrived, then returned it.
+  DISPATCH_CLASS_WAITED = 2;
+  // No assignment arrived before the request's wait expired.
+  DISPATCH_CLASS_EMPTY = 3;
+}
+
 message NextTaskResponse {
   oneof result {
     Assignment assignment = 1;
     Void no_task = 2;
   }
+  DispatchClass dispatch_class = 3;
+}
+
+message RunStatusRequest {}
+
+message RunStatusResponse {
+  bool drained = 1;
+  uint64 tasks_completed = 2;
+  uint64 total_tasks = 3;
 }

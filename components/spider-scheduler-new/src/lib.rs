@@ -36,6 +36,7 @@
 //! free space, so no single group can take over the dispatch buffer and a newly arrived group
 //! always finds room to publish.
 
+pub mod bench;
 pub mod config;
 pub mod core;
 pub mod dispatch_queue;
@@ -53,6 +54,17 @@ pub(crate) mod scheduling_unit;
 #[cfg(test)]
 mod tests;
 
+pub use crate::bench::BenchCase;
+pub use crate::bench::JobE2eRecord;
+pub use crate::bench::JobProgress;
+pub use crate::bench::JobProgressMap;
+pub use crate::bench::LatencyHistogram;
+pub use crate::bench::LatencySeries;
+pub use crate::bench::SchedulerResults;
+pub use crate::bench::TickSample;
+pub use crate::bench::TickStep;
+pub use crate::bench::TickTimer;
+pub use crate::bench::WorkerResults;
 pub use crate::config::CoreConfig;
 pub use crate::error::CoreError;
 pub use crate::error::HarnessError;

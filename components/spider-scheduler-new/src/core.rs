@@ -5,6 +5,9 @@
 //! retires the jobs that ran dry. The loop holds `Rc`-shared scheduling state across await points
 //! and is therefore `!Send`: it runs on a dedicated thread under a `LocalSet`, while the inbound
 //! polls it issues are ordinary `Send` background tasks.
+//!
+//! Every tick is timed step by step into a [`TickSample`]. Being single-threaded, the core owns the
+//! resulting log outright and hands it back when the loop stops.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -19,6 +22,9 @@ use tokio::select;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_util::sync::CancellationToken;
 
+use crate::bench::results::TickSample;
+use crate::bench::results::TickStep;
+use crate::bench::results::TickTimer;
 use crate::config::CoreConfig;
 use crate::dispatch_queue::GlobalDispatchQueue;
 use crate::error::CoreError;
@@ -88,6 +94,7 @@ pub struct Core<StorageClientType: SchedulerStorageClient> {
     inbound_queue_reader: AsyncInboundQueueReader<StorageClientType>,
     reschedule_queue_reader: UnboundedReceiver<TaskAssignment>,
     cancellation_token: CancellationToken,
+    tick_samples: Vec<TickSample>,
 }
 
 impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
@@ -121,13 +128,41 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
             inbound_queue_reader: AsyncInboundQueueReader::new(storage_client),
             reschedule_queue_reader,
             cancellation_token,
+            tick_samples: Vec::new(),
         }
+    }
+
+    /// Reserves room for `num_ticks` tick samples.
+    ///
+    /// A benchmark run knows how many ticks to expect from its duration and tick interval, and
+    /// reserving up front keeps the sample log from growing while the loop is being measured.
+    ///
+    /// # Returns
+    ///
+    /// The core, with its sample log able to hold `num_ticks` samples without growing.
+    #[must_use]
+    pub fn with_tick_sample_capacity(mut self, num_ticks: usize) -> Self {
+        self.tick_samples.reserve(num_ticks);
+
+        self
+    }
+
+    /// # Returns
+    ///
+    /// The samples of every tick executed so far, in tick order.
+    #[must_use]
+    pub fn tick_samples(&self) -> &[TickSample] {
+        &self.tick_samples
     }
 
     /// Runs the scheduling loop until the cancellation token is triggered.
     ///
     /// Each iteration executes one [`Self::tick`] and then sleeps for the remainder of the
     /// configured tick interval.
+    ///
+    /// # Returns
+    ///
+    /// The samples of every tick the loop executed, in tick order, on success.
     ///
     /// # Errors
     ///
@@ -137,7 +172,7 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
     // The core co-owns its scheduling state through `Rc`, so its future is `!Send` by
     // construction. It runs on a dedicated thread under a `LocalSet`, never on a shared executor.
     #[allow(clippy::future_not_send)]
-    pub async fn run(mut self) -> Result<(), CoreError> {
+    pub async fn run(mut self) -> Result<Vec<TickSample>, CoreError> {
         tracing::info!(
             config = ? self.config,
             init_session_id = self.session_manager.current(),
@@ -149,8 +184,11 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
             let cancellation_token = self.cancellation_token.clone();
             select! {
                 () = cancellation_token.cancelled() => {
-                    tracing::info!("Prototype scheduler core cancelled. Shutting down.");
-                    return Ok(());
+                    tracing::info!(
+                        num_ticks = self.tick_samples.len(),
+                        "Prototype scheduler core cancelled. Shutting down."
+                    );
+                    return Ok(self.tick_samples);
                 }
                 result = self.tick() => {
                     result.inspect_err(|e| tracing::error!(
@@ -168,10 +206,20 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
         }
     }
 
-    /// Executes one tick of the scheduling loop.
+    /// Executes one tick of the scheduling loop, appending its [`TickSample`] to the sample log.
     ///
     /// Processing the polling results is skipped while a storage poll is still in flight, but the
-    /// dispatch buffer is refilled from already-buffered tasks on every tick regardless.
+    /// dispatch buffer is refilled from already-buffered tasks on every tick regardless. A skipped
+    /// step is reported as zero.
+    ///
+    /// The measurements come with two caveats a reader needs:
+    ///
+    /// * The collect step is a non-blocking [`AsyncInboundQueueReader::try_collect_result`], so its
+    ///   cost is the bookkeeping of taking a finished poll's results rather than time spent waiting
+    ///   on storage.
+    /// * Starting the next poll is billed to the apply step rather than to the collect step it
+    ///   belongs to conceptually, because the poll's per-lane fetch counts are derived from the
+    ///   buffer occupancy the earlier steps produce and it must therefore run after them.
     ///
     /// # Errors
     ///
@@ -183,6 +231,7 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
     // the await points below, and runs under a `LocalSet` rather than a shared executor.
     #[allow(clippy::future_not_send)]
     pub(crate) async fn tick(&mut self) -> Result<(), CoreError> {
+        let mut timer = TickTimer::start();
         let poll_state = self
             .inbound_queue_reader
             .try_collect_result(self.session_manager.current())
@@ -198,21 +247,36 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
                     self.apply_session_bump(session_id);
                 }
                 let rescheduled_entries = self.drain_reschedule_queue(session_id);
+                timer.finish_step(TickStep::Collect);
+
                 let rg_updates = self.process_polling_results(
                     commit_ready_entries,
                     cleanup_ready_entries,
                     ready_entries,
                     rescheduled_entries,
                 );
+                timer.finish_step(TickStep::Process);
+
                 self.apply_rg_updates(rg_updates);
                 self.start_inbound_poll()?;
+                timer.finish_step(TickStep::Apply);
             }
-            InboundPollState::NotStarted => self.start_inbound_poll()?,
-            InboundPollState::Pending => {}
+            InboundPollState::NotStarted => {
+                self.start_inbound_poll()?;
+                timer.finish_step(TickStep::Collect);
+            }
+            InboundPollState::Pending => timer.finish_step(TickStep::Collect),
         }
 
-        let jobs_to_retire = self.fill_dispatch_queues();
+        let (jobs_to_retire, assignments_published) = self.fill_dispatch_queues();
+        timer.finish_step(TickStep::Fill);
+
         self.retire_jobs(jobs_to_retire);
+        timer.finish_step(TickStep::Retire);
+
+        let active_resource_groups = u64::try_from(self.active_rg_list.len()).unwrap_or(u64::MAX);
+        self.tick_samples
+            .push(timer.finish(assignments_published, active_resource_groups));
         Ok(())
     }
 
@@ -399,11 +463,15 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
     ///
     /// # Returns
     ///
-    /// The jobs that exhausted their downgrade budget and must be retired.
-    fn fill_dispatch_queues(&mut self) -> Vec<JobId> {
+    /// A tuple containing:
+    ///
+    /// * The jobs that exhausted their downgrade budget and must be retired.
+    /// * The number of assignments published.
+    fn fill_dispatch_queues(&mut self) -> (Vec<JobId>, u64) {
         let mut jobs_to_retire = Vec::new();
+        let mut assignments_published = 0;
         if self.active_rg_list.is_empty() {
-            return jobs_to_retire;
+            return (jobs_to_retire, assignments_published);
         }
 
         let mut rg_rr_list = Vec::with_capacity(self.active_rg_list.len());
@@ -449,6 +517,7 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
                 Ok((job_id, task_id)) => {
                     self.global_task_set.remove(&(job_id, task_id));
                     free -= 1;
+                    assignments_published += 1;
                     self.last_served_rg = Some(unit.borrow().rg_id);
                     arm = (arm + 1) % rg_rr_list.len();
                 }
@@ -471,7 +540,7 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
         }
         self.deactivate_exhausted_units(exhausted_units);
 
-        jobs_to_retire
+        (jobs_to_retire, assignments_published)
     }
 
     /// Takes every exhausted group that also holds no assignment off the active resource group
@@ -559,7 +628,7 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
 }
 
 /// Runs the core built by `core_factory` on a dedicated OS thread, under a current-thread runtime
-/// and a `LocalSet`.
+/// and a `LocalSet`, discarding the core's tick samples.
 ///
 /// The core is built on the spawned thread rather than handed to it: it co-owns its scheduling
 /// state through `Rc` and is therefore `!Send`.
@@ -578,14 +647,61 @@ pub fn run_core_on_dedicated_thread<
 >(
     core_factory: CoreFactoryType,
 ) -> std::thread::JoinHandle<Result<(), CoreError>> {
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| CoreError::Internal(e.to_string()))?;
-        let local_set = tokio::task::LocalSet::new();
-        local_set.block_on(&runtime, core_factory().run())
-    })
+    std::thread::spawn(move || run_core_locally(core_factory).map(|_| ()))
+}
+
+/// Runs the core built by `core_factory` exactly as [`run_core_on_dedicated_thread`] does, keeping
+/// its tick samples.
+///
+/// # Type Parameters
+///
+/// * `StorageClientType` - The storage client the core polls the inbound queue through.
+/// * `CoreFactoryType` - The factory that builds the core on the spawned thread.
+///
+/// # Returns
+///
+/// The join handle of the spawned thread, resolving to the core's tick samples or to its exit
+/// status on failure.
+pub fn run_core_on_dedicated_thread_with_tick_samples<
+    StorageClientType: SchedulerStorageClient,
+    CoreFactoryType: FnOnce() -> Core<StorageClientType> + Send + 'static,
+>(
+    core_factory: CoreFactoryType,
+) -> std::thread::JoinHandle<Result<Vec<TickSample>, CoreError>> {
+    std::thread::spawn(move || run_core_locally(core_factory))
+}
+
+/// Builds a core with `core_factory` on the calling thread and runs it to completion under a
+/// current-thread runtime and a `LocalSet`.
+///
+/// # Type Parameters
+///
+/// * `StorageClientType` - The storage client the core polls the inbound queue through.
+/// * `CoreFactoryType` - The factory that builds the core.
+///
+/// # Returns
+///
+/// Forwards [`Core::run`]'s return value on success.
+///
+/// # Errors
+///
+/// Returns an error if:
+///
+/// * [`CoreError::Internal`] if the runtime could not be built.
+/// * Forwards [`Core::run`]'s return values on failure.
+fn run_core_locally<
+    StorageClientType: SchedulerStorageClient,
+    CoreFactoryType: FnOnce() -> Core<StorageClientType>,
+>(
+    core_factory: CoreFactoryType,
+) -> Result<Vec<TickSample>, CoreError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| CoreError::Internal(e.to_string()))?;
+    let local_set = tokio::task::LocalSet::new();
+
+    local_set.block_on(&runtime, core_factory().run())
 }
 
 /// The number of chances a job that produced no task gets before it is retired.

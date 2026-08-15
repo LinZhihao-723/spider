@@ -31,12 +31,21 @@ pub mod metrics;
 
 pub use crate::harness::fake_storage::FakeStorage;
 pub use crate::harness::fake_storage::FakeStorageConfig;
+pub use crate::harness::fake_storage::FirstSeenRecorder;
+pub use crate::harness::fake_storage::ReleaseConfig;
 pub use crate::harness::fake_worker::FakeWorker;
 pub use crate::harness::fake_worker::FakeWorkerConfig;
+pub use crate::harness::fake_worker::WorkerPool;
+pub use crate::harness::fake_worker::WorkerPoolConfig;
 pub use crate::harness::fake_worker::WorkerReport;
+pub use crate::harness::grpc_service::BenchInstrumentation;
 pub use crate::harness::grpc_service::HarnessServer;
+pub use crate::harness::metrics::DispatchClass;
 pub use crate::harness::metrics::DispatchRecord;
 pub use crate::harness::metrics::LatencySamples;
+pub use crate::harness::metrics::WorkerKind;
+pub use crate::harness::metrics::WorkerPoolReport;
+pub use crate::harness::metrics::WorkerSamples;
 
 /// How often a run re-checks whether the workload has drained.
 const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(5);

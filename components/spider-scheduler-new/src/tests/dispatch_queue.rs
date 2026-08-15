@@ -11,6 +11,7 @@ use super::make_job_entry;
 use super::make_unit;
 use super::reader_of;
 use crate::core::TaskAssignmentIdIssuer;
+use crate::dispatch_queue::DispatchOutcome;
 use crate::dispatch_queue::DispatchService;
 use crate::dispatch_queue::GlobalDispatchQueue;
 use crate::job_registry::JobRegistry;
@@ -36,6 +37,11 @@ const FREE_SPACE: usize = DISPATCH_QUEUE_CAPACITY;
 
 /// The time a test lets a dispatch call block before it concludes nothing is coming.
 const DISPATCH_WAIT: Duration = Duration::from_millis(50);
+
+/// How long a test that exercises the waited class leaves the queue empty before publishing into
+/// it, short enough that the dispatch call is still waiting and long enough that it has stopped
+/// polling and started waiting.
+const PUBLISH_DELAY: Duration = Duration::from_millis(5);
 
 /// One resource group's publishing side, wired to the structures a test inspects.
 struct PublisherFixture {
@@ -254,6 +260,90 @@ async fn next_task_general_discards_a_stale_hint_without_touching_the_hint_count
 
     assert_eq!(service.next_task_general(DISPATCH_WAIT).await, None);
     assert_eq!(endpoints.reader.living_hint().load(Ordering::Acquire), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn next_task_pinned_classifies_an_already_queued_assignment_as_immediate()
+-> anyhow::Result<()> {
+    let (service, rg_table, _global_queue) = make_dispatch_service(DEFAULT_SESSION_ID);
+    let endpoints = rg_table.get_or_create(RG_ID, DEFAULT_SESSION_ID);
+    let assignment = make_assignment(RG_ID, JOB_ID, TaskId::Index(0), DEFAULT_SESSION_ID);
+    assert!(endpoints.sender.try_send(assignment).is_ok());
+
+    assert_eq!(
+        service
+            .next_task_pinned_classified(RG_ID, DISPATCH_WAIT)
+            .await,
+        DispatchOutcome::Immediate(assignment)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn next_task_pinned_classifies_an_assignment_published_after_the_request_as_waited()
+-> anyhow::Result<()> {
+    let (service, rg_table, _global_queue) = make_dispatch_service(DEFAULT_SESSION_ID);
+    let endpoints = rg_table.get_or_create(RG_ID, DEFAULT_SESSION_ID);
+    let assignment = make_assignment(RG_ID, JOB_ID, TaskId::Index(0), DEFAULT_SESSION_ID);
+    let sender = endpoints.sender.clone();
+    let publisher = tokio::spawn(async move {
+        tokio::time::sleep(PUBLISH_DELAY).await;
+        sender.try_send(assignment).is_ok()
+    });
+
+    let outcome = service
+        .next_task_pinned_classified(RG_ID, DISPATCH_WAIT)
+        .await;
+
+    assert!(publisher.await.expect("the publishing task finishes"));
+    assert_eq!(outcome, DispatchOutcome::Waited(assignment));
+    Ok(())
+}
+
+#[tokio::test]
+async fn next_task_general_classifies_an_already_hinted_assignment_as_immediate()
+-> anyhow::Result<()> {
+    let (service, rg_table, global_queue) = make_dispatch_service(DEFAULT_SESSION_ID);
+    let endpoints = rg_table.get_or_create(RG_ID, DEFAULT_SESSION_ID);
+    let assignment = make_assignment(RG_ID, JOB_ID, TaskId::Index(0), DEFAULT_SESSION_ID);
+    assert!(endpoints.sender.try_send(assignment).is_ok());
+    endpoints
+        .reader
+        .living_hint()
+        .fetch_add(1, Ordering::Release);
+    assert!(global_queue.try_send(endpoints.reader.clone()));
+
+    assert_eq!(
+        service.next_task_general_classified(DISPATCH_WAIT).await,
+        DispatchOutcome::Immediate(assignment)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn next_task_general_classifies_a_hint_published_after_the_request_as_waited()
+-> anyhow::Result<()> {
+    let (service, rg_table, global_queue) = make_dispatch_service(DEFAULT_SESSION_ID);
+    let endpoints = rg_table.get_or_create(RG_ID, DEFAULT_SESSION_ID);
+    let assignment = make_assignment(RG_ID, JOB_ID, TaskId::Index(0), DEFAULT_SESSION_ID);
+    let publisher = tokio::spawn(async move {
+        tokio::time::sleep(PUBLISH_DELAY).await;
+        if endpoints.sender.try_send(assignment).is_err() {
+            return false;
+        }
+        endpoints
+            .reader
+            .living_hint()
+            .fetch_add(1, Ordering::Release);
+
+        global_queue.try_send(endpoints.reader.clone())
+    });
+
+    let outcome = service.next_task_general_classified(DISPATCH_WAIT).await;
+
+    assert!(publisher.await.expect("the publishing task finishes"));
+    assert_eq!(outcome, DispatchOutcome::Waited(assignment));
     Ok(())
 }
 
