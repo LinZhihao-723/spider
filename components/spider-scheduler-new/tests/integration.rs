@@ -6,10 +6,13 @@
 //! manager would.
 //!
 //! The assertions are on observed behaviour -- which assignment reached which worker, and in what
-//! mint order -- rather than on elapsed time, so the suite stays meaningful on a loaded machine.
-//! The core *mints* an assignment when it stamps a globally unique ID onto it at publication, so
-//! sorting the workers' records by that ID recovers the core's decision order, even though the
-//! workers received those assignments concurrently and out of order.
+//! mint order -- rather than on absolute elapsed time, so the suite stays meaningful on a loaded
+//! machine. The core *mints* an assignment when it stamps a globally unique ID onto it at
+//! publication, so sorting the workers' records by that ID recovers the core's decision order, even
+//! though the workers received those assignments concurrently and out of order. Where a scenario
+//! has to measure time -- non-interference is a statement about throughput and cannot be read off
+//! an ordering -- it compares a run against a calibration run of the same workload rather than
+//! against a wall-clock threshold.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -23,6 +26,7 @@ use spider_scheduler_new::harness::FakeStorageConfig;
 use spider_scheduler_new::harness::FakeWorkerConfig;
 use spider_scheduler_new::harness::Harness;
 use spider_scheduler_new::harness::HarnessConfig;
+use spider_scheduler_new::harness::HarnessOutcome;
 use spider_scheduler_new::harness::WorkerReport;
 use spider_scheduler_new::types::JobId;
 use spider_scheduler_new::types::ResourceGroupId;
@@ -200,53 +204,90 @@ async fn unpinned_resource_groups_drain_through_general_workers() -> anyhow::Res
     Ok(())
 }
 
-/// Verifies that one resource group draining far more slowly than the rest neither blocks the
-/// others nor takes over the dispatch buffer.
+/// Verifies the non-interference property of design §1.1: one resource group draining far more
+/// slowly than the rest neither blocks the others nor takes over the dispatch buffer.
 ///
-/// The occupancy bound is read off the mint order rather than measured directly. A run of
+/// Interference is measured as the per-resource-group mean job completion time, and the scenario is
+/// dimensioned so that every group stays backlogged for the whole run rather than for a brief
+/// window at the start. The same workload is run twice: once with every worker fast, which
+/// calibrates what a group's jobs cost when no group is slow, and once with the first group's
+/// worker ten times slower. A fast group that is being starved by the slow group's backlog shows up
+/// as its own completion time inflating against its own baseline. The baseline is what makes the
+/// three fast groups' figures interpretable: were the slow group to take over the buffer, all three
+/// would be starved alike and would still look consistent with each other.
+///
+/// The baseline is conservative. With four fast workers it contends for the core's throughput more
+/// than the contended run does, so a correct implementation completes the fast groups no slower
+/// under contention than in the baseline.
+///
+/// The mint-order run bound is retained as secondary evidence of buffer occupancy: a run of
 /// consecutive assignments minted for the slow group is a run in which no other group was served,
-/// and the slow worker consumes at most one assignment per `SLOW_TASK_DURATION_MS`, fifty times
-/// the core's tick interval; a run of `n` such mints therefore drives the slow group's queue
-/// occupancy to nearly `n`. Bounding the longest run by half the dispatch buffer
-/// is bounding the group's peak occupancy by the same figure, which is the ceiling the admission
-/// policy's `S < F` rule imposes when a single group is backlogged.
+/// so bounding it by half the dispatch buffer bounds the group's peak occupancy by the ceiling the
+/// admission policy's `S < F` rule imposes when a single group is backlogged.
 ///
 /// # Errors
 ///
 /// Returns an error if:
 ///
-/// * Forwards [`Harness::start`]'s return values on failure.
-/// * Forwards [`Harness::run_until_drained`]'s return values on failure.
+/// * Forwards [`run_slow_group_scenario`]'s return values on failure.
 /// * Forwards [`check_exactly_once`]'s return values on failure.
 /// * Forwards [`check_pinned_isolation`]'s return values on failure.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slow_resource_group_neither_blocks_nor_takes_over_the_buffer() -> anyhow::Result<()> {
-    const SLOW_TASK_DURATION_MS: u64 = 50;
+    const SLOW_TASK_DURATION_MS: u64 = 10;
     const DISPATCH_QUEUE_CAPACITY: usize = 32;
+
+    /// The factor by which a fast group's mean job completion time may exceed its own baseline
+    /// figure. Over 32 measured pairs of runs the worst slowdown was 1.32x, all of it run-to-run
+    /// noise, so the bound leaves the noise room while still catching the starvation it exists for,
+    /// which would inflate the figure by the ten-fold ratio between the two task durations.
+    const MAX_CONTENDED_SLOWDOWN: f64 = 2.0;
+
+    /// The factor by which the slowest fast group's mean job completion time may exceed the
+    /// fastest's. This bound is coarse by necessity: the baseline runs, which have no slow group at
+    /// all, spread by up to 1.6x over the same 32 measurements, so anything tighter would be
+    /// measuring the harness rather than the scheduler.
+    const MAX_FAST_GROUP_SPREAD: f64 = 1.8;
 
     let num_resource_groups = 4;
     let num_jobs_per_group = 2;
-    let num_tasks_per_job = 24;
+    let num_tasks_per_job = 128;
     let slow_group = resource_group_id(0);
-    let mut workers = vec![pinned_worker(0, SLOW_TASK_DURATION_MS)];
-    workers.extend((1..4).map(|group_index| pinned_worker(group_index, FAST_TASK_DURATION_MS)));
-    let harness = Harness::start(HarnessConfig {
-        core: core_config(DISPATCH_QUEUE_CAPACITY, 256, 4),
-        storage: storage_config(
-            num_resource_groups,
-            num_jobs_per_group,
-            num_tasks_per_job,
-            false,
-        ),
-        workers,
-    })
+
+    let baseline = run_slow_group_scenario(
+        num_resource_groups,
+        num_jobs_per_group,
+        num_tasks_per_job,
+        DISPATCH_QUEUE_CAPACITY,
+        FAST_TASK_DURATION_MS,
+    )
     .await?;
+    let baseline_means = mean_job_completion_times(&baseline.reports);
+    let contended = run_slow_group_scenario(
+        num_resource_groups,
+        num_jobs_per_group,
+        num_tasks_per_job,
+        DISPATCH_QUEUE_CAPACITY,
+        SLOW_TASK_DURATION_MS,
+    )
+    .await?;
+    let contended_means = mean_job_completion_times(&contended.reports);
 
-    let outcome = harness.run_until_drained(SMALL_SCENARIO_TIMEOUT).await?;
+    println!(
+        "baseline mean job completion: {}",
+        format_means(&baseline_means)
+    );
+    println!(
+        "contended mean job completion: {}",
+        format_means(&contended_means)
+    );
 
-    check_exactly_once(&outcome.reports, &outcome.storage.expected_regular_tasks())?;
-    check_pinned_isolation(&outcome.reports)?;
-    for report in &outcome.reports {
+    check_exactly_once(
+        &contended.reports,
+        &contended.storage.expected_regular_tasks(),
+    )?;
+    check_pinned_isolation(&contended.reports)?;
+    for report in &contended.reports {
         assert_eq!(
             report.dispatches.len(),
             num_jobs_per_group * num_tasks_per_job,
@@ -254,14 +295,47 @@ async fn a_slow_resource_group_neither_blocks_nor_takes_over_the_buffer() -> any
             report.execution_manager_id
         );
     }
-    let longest_run = longest_uninterrupted_mint_run(&mint_order(&outcome.reports), slow_group);
+
+    let mut fast_group_means: Vec<(ResourceGroupId, Duration)> = Vec::new();
+    for group_index in 1..num_resource_groups {
+        let rg_id = resource_group_id(group_index);
+        let baseline_mean = mean_of(&baseline_means, rg_id);
+        let contended_mean = mean_of(&contended_means, rg_id);
+        let slowdown = duration_ratio(contended_mean, baseline_mean);
+        assert!(
+            slowdown <= MAX_CONTENDED_SLOWDOWN,
+            "resource group {rg_id}'s jobs took {contended_mean:?} on average against a baseline \
+             of {baseline_mean:?}, a slowdown of {slowdown:.2}x, so the slow group interfered \
+             with it"
+        );
+        fast_group_means.push((rg_id, contended_mean));
+    }
+
+    let slowest = fast_group_means
+        .iter()
+        .map(|(_, mean)| *mean)
+        .max()
+        .expect("the scenario has at least one fast resource group");
+    let fastest = fast_group_means
+        .iter()
+        .map(|(_, mean)| *mean)
+        .min()
+        .expect("the scenario has at least one fast resource group");
+    let spread = duration_ratio(slowest, fastest);
+    assert!(
+        spread <= MAX_FAST_GROUP_SPREAD,
+        "the fast resource groups' mean job completion times spread by {spread:.2}x: {}",
+        format_group_means(&fast_group_means)
+    );
+
+    let longest_run = longest_uninterrupted_mint_run(&mint_order(&contended.reports), slow_group);
     assert!(
         longest_run <= DISPATCH_QUEUE_CAPACITY / 2,
         "the slow resource group held {longest_run} of the {DISPATCH_QUEUE_CAPACITY}-slot \
          dispatch buffer"
     );
     assert!(
-        outcome.storage.is_drained(),
+        contended.storage.is_drained(),
         "the workload did not drain within the timeout"
     );
 
@@ -443,6 +517,47 @@ async fn a_mid_run_session_bump_replays_every_unfinished_task() -> anyhow::Resul
     );
 
     Ok(())
+}
+
+/// Runs one slow-group scenario: the worker pinned to the first resource group executes its tasks
+/// in `slow_task_duration_ms`, every other group gets a worker running at
+/// [`FAST_TASK_DURATION_MS`], and all of them drain a workload of the given dimensions.
+///
+/// # Returns
+///
+/// The run's outcome on success.
+///
+/// # Errors
+///
+/// Returns an error if:
+///
+/// * Forwards [`Harness::start`]'s return values on failure.
+/// * Forwards [`Harness::run_until_drained`]'s return values on failure.
+async fn run_slow_group_scenario(
+    num_resource_groups: usize,
+    num_jobs_per_group: usize,
+    num_tasks_per_job: usize,
+    dispatch_queue_capacity: usize,
+    slow_task_duration_ms: u64,
+) -> anyhow::Result<HarnessOutcome> {
+    let mut workers = vec![pinned_worker(0, slow_task_duration_ms)];
+    workers.extend(
+        (1..num_resource_groups)
+            .map(|group_index| pinned_worker(group_index, FAST_TASK_DURATION_MS)),
+    );
+    let harness = Harness::start(HarnessConfig {
+        core: core_config(dispatch_queue_capacity, 256, 4),
+        storage: storage_config(
+            num_resource_groups,
+            num_jobs_per_group,
+            num_tasks_per_job,
+            false,
+        ),
+        workers,
+    })
+    .await?;
+
+    Ok(harness.run_until_drained(SMALL_SCENARIO_TIMEOUT).await?)
 }
 
 /// Asserts that the regular tasks the workers received are exactly the tasks the workload
@@ -706,6 +821,67 @@ fn longest_uninterrupted_mint_run(
     longest_run
 }
 
+/// Measures how long each resource group's jobs took to complete.
+///
+/// A job completes when the last of its regular tasks finishes executing, and a resource group's
+/// figure is the mean over its jobs. Every timestamp is measured from the same run-start origin, so
+/// the figures are comparable across resource groups and across runs of equal size.
+///
+/// # Returns
+///
+/// The mean job completion time of every resource group that appears in `reports`.
+fn mean_job_completion_times(reports: &[WorkerReport]) -> HashMap<ResourceGroupId, Duration> {
+    let mut job_completions: HashMap<(ResourceGroupId, JobId), Duration> = HashMap::new();
+    for record in reports.iter().flat_map(|report| report.dispatches.iter()) {
+        if !matches!(record.task_id, TaskId::Index(_)) {
+            continue;
+        }
+        let completion = job_completions
+            .entry((record.resource_group_id, record.job_id))
+            .or_default();
+        *completion = (*completion).max(record.completed_at);
+    }
+
+    let mut totals: HashMap<ResourceGroupId, (Duration, u32)> = HashMap::new();
+    for ((rg_id, _), completion) in job_completions {
+        let total = totals.entry(rg_id).or_insert((Duration::ZERO, 0));
+        total.0 = total.0.saturating_add(completion);
+        total.1 += 1;
+    }
+
+    totals
+        .into_iter()
+        .map(|(rg_id, (total, num_jobs))| (rg_id, total / num_jobs))
+        .collect()
+}
+
+/// # Returns
+///
+/// The mean job completion time `means` holds for `resource_group_id`.
+///
+/// # Panics
+///
+/// Panics if `means` holds no entry for `resource_group_id`.
+fn mean_of(
+    means: &HashMap<ResourceGroupId, Duration>,
+    resource_group_id: ResourceGroupId,
+) -> Duration {
+    *means
+        .get(&resource_group_id)
+        .expect("every resource group of the workload completed at least one job")
+}
+
+/// # Returns
+///
+/// `duration` as a multiple of `reference`, or [`f64::INFINITY`] if `reference` is zero.
+fn duration_ratio(duration: Duration, reference: Duration) -> f64 {
+    if reference.is_zero() {
+        return f64::INFINITY;
+    }
+
+    duration.as_secs_f64() / reference.as_secs_f64()
+}
+
 /// # Returns
 ///
 /// Every resource group that appears in at least one dispatched assignment.
@@ -788,6 +964,32 @@ fn format_duplicates(duplicated: &[((JobId, TaskId), usize)]) -> String {
         .join(", ");
 
     format!("{num_tasks} [{listed}{}]", format_elision(num_tasks))
+}
+
+/// # Returns
+///
+/// `means` rendered as a diagnostic in milliseconds, ordered by resource group.
+fn format_means(means: &HashMap<ResourceGroupId, Duration>) -> String {
+    let mut ordered: Vec<(ResourceGroupId, Duration)> =
+        means.iter().map(|(rg_id, mean)| (*rg_id, *mean)).collect();
+    ordered.sort_unstable_by_key(|(rg_id, _)| rg_id.get());
+
+    format_group_means(&ordered)
+}
+
+/// # Returns
+///
+/// `means` rendered as a diagnostic in milliseconds, in the order given.
+fn format_group_means(means: &[(ResourceGroupId, Duration)]) -> String {
+    if means.is_empty() {
+        return "none".to_owned();
+    }
+
+    means
+        .iter()
+        .map(|(rg_id, mean)| format!("group {rg_id}: {:.1} ms", mean.as_secs_f64() * 1000.0))
+        .collect::<Vec<String>>()
+        .join(", ")
 }
 
 /// # Returns

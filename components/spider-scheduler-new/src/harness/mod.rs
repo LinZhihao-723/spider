@@ -8,6 +8,7 @@
 
 use std::thread::JoinHandle;
 use std::time::Duration;
+use std::time::Instant;
 
 use tokio::sync::mpsc::unbounded_channel;
 use tokio_util::sync::CancellationToken;
@@ -161,11 +162,13 @@ impl Harness {
     ) -> Result<HarnessOutcome, HarnessError> {
         let endpoint = self.server.endpoint();
         let worker_cancellation_token = CancellationToken::new();
+        let run_start = Instant::now();
         let mut worker_tasks = Vec::with_capacity(self.worker_configs.len());
         for worker_config in self.worker_configs {
             worker_tasks.push(tokio::spawn(FakeWorker::run(
                 worker_config,
                 endpoint.clone(),
+                run_start,
                 worker_cancellation_token.clone(),
             )));
         }

@@ -65,6 +65,9 @@ impl FakeWorker {
     /// Each iteration issues one `NextTask` request, reports the previously received assignment as
     /// completed, and sleeps for the configured task duration whenever an assignment came back.
     ///
+    /// Every dispatch record is timestamped relative to `run_start`, so records taken from
+    /// different workers of the same run share one origin and are directly comparable.
+    ///
     /// # Returns
     ///
     /// The worker's report on success.
@@ -79,6 +82,7 @@ impl FakeWorker {
     pub async fn run(
         config: FakeWorkerConfig,
         endpoint: String,
+        run_start: Instant,
         cancellation_token: CancellationToken,
     ) -> Result<WorkerReport, HarnessError> {
         let mut client = connect(endpoint).await?;
@@ -126,19 +130,20 @@ impl FakeWorker {
                 continue;
             };
             let assignment = TaskAssignment::try_from(assignment)?;
-            report.dispatches.push(DispatchRecord {
-                assignment_id: assignment.id,
-                resource_group_id: assignment.resource_group_id,
-                job_id: assignment.job_id,
-                task_id: assignment.task_id,
-                latency,
-            });
             completed = Some(CompletedAssignment {
                 job_id: assignment.job_id.get(),
                 task_id: Some(WireTaskId::from(assignment.task_id)),
             });
 
             tokio::time::sleep(task_duration).await;
+            report.dispatches.push(DispatchRecord {
+                assignment_id: assignment.id,
+                resource_group_id: assignment.resource_group_id,
+                job_id: assignment.job_id,
+                task_id: assignment.task_id,
+                latency,
+                completed_at: run_start.elapsed(),
+            });
         }
 
         Ok(report)

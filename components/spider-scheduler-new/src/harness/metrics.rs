@@ -8,7 +8,8 @@ use crate::types::ResourceGroupId;
 use crate::types::TaskAssignmentId;
 use crate::types::TaskId;
 
-/// One assignment a worker received, together with the latency of the request that carried it.
+/// One assignment a worker received, together with the latency of the request that carried it and
+/// the time the worker finished executing it.
 #[derive(Clone, Debug)]
 pub struct DispatchRecord {
     /// The assignment's scheduler-minted identifier.
@@ -25,6 +26,10 @@ pub struct DispatchRecord {
 
     /// Client-side latency: request send to response receipt.
     pub latency: Duration,
+
+    /// Elapsed time from the start of the run to when the worker finished executing this
+    /// assignment.
+    pub completed_at: Duration,
 }
 
 /// The merged, sorted client-side latencies of every request a run's workers completed.
