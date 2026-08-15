@@ -6,12 +6,12 @@
 //! manager would.
 //!
 //! The assertions are on observed behaviour -- which assignment reached which worker, and in what
-//! mint order -- rather than on absolute elapsed time, so the suite stays meaningful on a loaded
-//! machine. The core *mints* an assignment when it stamps a globally unique ID onto it at
-//! publication, so sorting the workers' records by that ID recovers the core's decision order, even
-//! though the workers received those assignments concurrently and out of order. Where a scenario
-//! has to measure time -- non-interference is a statement about throughput and cannot be read off
-//! an ordering -- it compares a run against a calibration run of the same workload rather than
+//! publication order -- rather than on absolute elapsed time, so the suite stays meaningful on a
+//! loaded machine. The core stamps a globally unique ID onto an assignment as it publishes it, so
+//! sorting the workers' records by that ID recovers the core's decision order, even though the
+//! workers received those assignments concurrently and out of order. Where a scenario has to
+//! measure time -- non-interference is a statement about throughput and cannot be read off an
+//! ordering -- it compares a run against a calibration run of the same workload rather than
 //! against a wall-clock threshold.
 
 use std::collections::HashMap;
@@ -220,10 +220,10 @@ async fn unpinned_resource_groups_drain_through_general_workers() -> anyhow::Res
 /// than the contended run does, so a correct implementation completes the fast groups no slower
 /// under contention than in the baseline.
 ///
-/// The mint-order run bound is retained as secondary evidence of buffer occupancy: a run of
-/// consecutive assignments minted for the slow group is a run in which no other group was served,
-/// so bounding it by half the dispatch buffer bounds the group's peak occupancy by the ceiling the
-/// admission policy's `S < F` rule imposes when a single group is backlogged.
+/// The publication-order run bound is retained as secondary evidence of buffer occupancy: a run of
+/// consecutive assignments published for the slow group is a run in which no other group was
+/// served, so bounding it by half the dispatch buffer bounds the group's peak occupancy by the
+/// ceiling the admission policy's `S < F` rule imposes when a single group is backlogged.
 ///
 /// # Errors
 ///
@@ -328,7 +328,8 @@ async fn a_slow_resource_group_neither_blocks_nor_takes_over_the_buffer() -> any
         format_group_means(&fast_group_means)
     );
 
-    let longest_run = longest_uninterrupted_mint_run(&mint_order(&contended.reports), slow_group);
+    let longest_run =
+        longest_uninterrupted_publication_run(&publication_order(&contended.reports), slow_group);
     assert!(
         longest_run <= DISPATCH_QUEUE_CAPACITY / 2,
         "the slow resource group held {longest_run} of the {DISPATCH_QUEUE_CAPACITY}-slot \
@@ -682,7 +683,7 @@ fn check_pinned_isolation(reports: &[WorkerReport]) -> anyhow::Result<()> {
 }
 
 /// Asserts that every finalization task in `expected` was dispatched exactly once, after every
-/// regular task of its job had been minted, and that no other finalization task was dispatched.
+/// regular task of its job had been published, and that no other finalization task was dispatched.
 ///
 /// # Errors
 ///
@@ -696,20 +697,22 @@ fn check_finalization_tasks(
     expected: &HashSet<(JobId, TaskId)>,
 ) -> anyhow::Result<()> {
     let mut num_finalizations: HashMap<(JobId, TaskId), usize> = HashMap::new();
-    let mut finalization_mint: HashMap<JobId, u64> = HashMap::new();
-    let mut last_regular_mint: HashMap<JobId, u64> = HashMap::new();
+    let mut finalization_assignment_id: HashMap<JobId, u64> = HashMap::new();
+    let mut last_regular_assignment_id: HashMap<JobId, u64> = HashMap::new();
     for record in reports.iter().flat_map(|report| report.dispatches.iter()) {
-        let mint = record.assignment_id.get();
+        let assignment_id = record.assignment_id.get();
         if matches!(record.task_id, TaskId::Index(_)) {
-            let last = last_regular_mint.entry(record.job_id).or_default();
-            *last = (*last).max(mint);
+            let last = last_regular_assignment_id.entry(record.job_id).or_default();
+            *last = (*last).max(assignment_id);
             continue;
         }
         *num_finalizations
             .entry((record.job_id, record.task_id))
             .or_default() += 1;
-        let earliest = finalization_mint.entry(record.job_id).or_insert(mint);
-        *earliest = (*earliest).min(mint);
+        let earliest = finalization_assignment_id
+            .entry(record.job_id)
+            .or_insert(assignment_id);
+        *earliest = (*earliest).min(assignment_id);
     }
 
     let unexpected = sorted_tasks(
@@ -729,12 +732,18 @@ fn check_finalization_tasks(
         if 1 != num_dispatched {
             anyhow::bail!("job {job_id}'s {task_id} task was dispatched {num_dispatched} times");
         }
-        let finalization_mint = finalization_mint.get(&job_id).copied().unwrap_or_default();
-        let last_regular_mint = last_regular_mint.get(&job_id).copied().unwrap_or_default();
-        if finalization_mint <= last_regular_mint {
+        let finalization_assignment_id = finalization_assignment_id
+            .get(&job_id)
+            .copied()
+            .unwrap_or_default();
+        let last_regular_assignment_id = last_regular_assignment_id
+            .get(&job_id)
+            .copied()
+            .unwrap_or_default();
+        if finalization_assignment_id <= last_regular_assignment_id {
             anyhow::bail!(
-                "job {job_id}'s {task_id} task was minted at {finalization_mint}, ahead of its \
-                 regular task minted at {last_regular_mint}"
+                "job {job_id}'s {task_id} task was published at {finalization_assignment_id}, \
+                 ahead of its regular task published at {last_regular_assignment_id}"
             );
         }
     }
@@ -774,9 +783,9 @@ fn duplicated_dispatches(reports: &[WorkerReport]) -> Vec<((JobId, TaskId), usiz
 
 /// # Returns
 ///
-/// Every dispatched assignment of every worker, ordered by the assignment ID the core minted it
-/// with, which is the order the core published them in.
-fn mint_order(reports: &[WorkerReport]) -> Vec<&DispatchRecord> {
+/// Every dispatched assignment of every worker, ordered by the assignment ID the core stamped onto
+/// it, which is the order the core published them in.
+fn publication_order(reports: &[WorkerReport]) -> Vec<&DispatchRecord> {
     let mut records: Vec<&DispatchRecord> = reports
         .iter()
         .flat_map(|report| report.dispatches.iter())
@@ -788,28 +797,28 @@ fn mint_order(reports: &[WorkerReport]) -> Vec<&DispatchRecord> {
 
 /// Measures how far `resource_group_id` ever got ahead of the rest of the workload.
 ///
-/// The search is confined to the mints made before the last mint of any other resource group, so a
-/// group's uncontested tail -- everything it publishes once the other groups are finished -- does
-/// not count against it.
+/// The search is confined to the publications made before the last publication of any other
+/// resource group, so a group's uncontested tail -- everything it publishes once the other groups
+/// are finished -- does not count against it.
 ///
 /// # Returns
 ///
-/// The longest run of consecutive assignments minted for `resource_group_id` with no other
+/// The longest run of consecutive assignments published for `resource_group_id` with no other
 /// resource group's assignment in between.
-fn longest_uninterrupted_mint_run(
-    mint_order: &[&DispatchRecord],
+fn longest_uninterrupted_publication_run(
+    publication_order: &[&DispatchRecord],
     resource_group_id: ResourceGroupId,
 ) -> usize {
-    let Some(last_other_index) = mint_order
+    let Some(last_other_index) = publication_order
         .iter()
         .rposition(|record| record.resource_group_id != resource_group_id)
     else {
-        return mint_order.len();
+        return publication_order.len();
     };
 
     let mut longest_run = 0;
     let mut current_run = 0;
-    for record in &mint_order[..last_other_index] {
+    for record in &publication_order[..last_other_index] {
         if record.resource_group_id == resource_group_id {
             current_run += 1;
             longest_run = longest_run.max(current_run);

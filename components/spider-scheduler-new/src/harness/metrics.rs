@@ -12,7 +12,7 @@ use crate::types::TaskId;
 /// the time the worker finished executing it.
 #[derive(Clone, Debug)]
 pub struct DispatchRecord {
-    /// The assignment's scheduler-minted identifier.
+    /// The identifier the scheduler stamped onto the assignment when it published it.
     pub assignment_id: TaskAssignmentId,
 
     /// The resource group the assignment belongs to.

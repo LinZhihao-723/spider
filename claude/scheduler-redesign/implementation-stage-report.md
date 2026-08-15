@@ -6,9 +6,9 @@ Performance evaluation is a separate stage and is deliberately out of scope. No 
 
 ### Terminology
 
-**Mint.** The core *mints* an assignment when it stamps a fresh, globally unique `TaskAssignmentId` onto it at the moment of publication — `TaskAssignmentIdIssuer::next` in `core.rs`, called from `publish` in `scheduling_unit.rs` immediately before the assignment enters its group's queue. Minting is the act of committing to a scheduling decision, as distinct from an execution manager later *dispatching* that assignment.
+**Publish vs. dispatch.** The core *publishes* an assignment: `publish` in `scheduling_unit.rs` stamps a fresh, globally unique `TaskAssignmentId` from `TaskAssignmentIdIssuer` and sends the assignment into its resource group's queue. Publication is the core committing to a scheduling decision. *Dispatch* is the later, separate event of an execution manager pulling that assignment over gRPC. The two are distinct in time and the tests depend on the distinction.
 
-**Mint order.** The order assignments were minted in, recovered by sorting on assignment ID. Because the core is single-threaded and the issuer is a single global counter, mint order is a total order on the core's decisions. It is observable from workers' records alone, even though workers receive assignments concurrently and out of order — which is why the integration tests assert on mint order rather than on elapsed time, and why they stay meaningful on a loaded machine.
+**Publication order.** The order assignments were published in, recovered by sorting on assignment ID. Because the core is single-threaded and the issuer is a single global counter, publication order is a total order on the core's decisions. It is observable from workers' records alone, even though workers receive assignments concurrently and out of order — which is why the integration tests assert on publication order rather than on absolute elapsed time, and why they stay meaningful on a loaded machine.
 
 **Pinned / general execution manager.** A *pinned* manager names a resource group and may receive assignments only from it. A *general* manager names none and may receive any assignment. The distinction is the reason the hint channel exists.
 
@@ -116,8 +116,8 @@ These drive the core and its data structures directly, with no gRPC and no worke
 | `a_general_pop_consumes_one_hint` | `H` decrements by exactly one |
 | `a_stale_hint_on_an_empty_group_consumes_the_hint_and_yields_nothing` | A stale hint is consumed, not requeued |
 | `next_task_general_discards_a_stale_hint_without_touching_the_hint_count` | §8.2 req. 4 — asserts `H` is *still* 1 afterwards |
-| `next_task_general_drops_an_assignment_minted_in_a_stale_session` | §7.3 on the general path |
-| `next_task_pinned_drops_an_assignment_minted_in_a_stale_session` | §7.3 on the pinned path |
+| `next_task_general_drops_an_assignment_published_in_a_stale_session` | §7.3 on the general path |
+| `next_task_pinned_drops_an_assignment_published_in_a_stale_session` | §7.3 on the pinned path |
 
 **`src/tests/job_registry.rs` — 7.** Design §3.3: upsert of a new job vs. an existing one, scheduling position preserved on append, `finalize_and_remove`, `get_next_task` returning `Err` on a finalized entry, `downgrade_counter` restored on insert, `take_ready_tasks` draining without finalizing, and `remove`/`clear`.
 
@@ -149,7 +149,7 @@ Full stack: the real core on its dedicated thread, the real gRPC server, real gR
 | `general_workers_alone_drain_every_resource_group` | 4 RG × 4 jobs × 16 tasks, 4 general workers | Exactly-once over the merged multiset; all 4 groups served; drained. With no pinned worker in existence, every one of the 256 assignments had to be reached by a hint — this is the §8.1 coverage invariant observed end to end |
 | `pinned_workers_receive_only_their_own_resource_group` | 4 RG, one pinned worker each | Exactly-once; **zero** foreign-group assignments per worker; each worker's count is exactly its group's workload |
 | `unpinned_resource_groups_drain_through_general_workers` | 6 RG, 3 pinned + 3 general | Exactly-once; pinned isolation; all 3 unpinned groups appear in general workers' records — §1.1's "a group whose dedicated managers are absent is still fully served" |
-| `a_slow_resource_group_neither_blocks_nor_takes_over_the_buffer` | 4 RG × 2 jobs × 128 tasks (1 024 total), `B = 32`; run **twice** — a baseline with all four workers at 1 ms/task, then a contended run with RG0's worker at 10 ms/task | **Non-interference**: each fast group's mean job completion time in the contended run ≤ 2.0× its *own* baseline figure. **Cross-group fairness**: the three fast groups within 1.8× of each other. Plus exactly-once, pinned isolation, full workload per worker, and the mint-run occupancy proxy ≤ `B/2` |
+| `a_slow_resource_group_neither_blocks_nor_takes_over_the_buffer` | 4 RG × 2 jobs × 128 tasks (1 024 total), `B = 32`; run **twice** — a baseline with all four workers at 1 ms/task, then a contended run with RG0's worker at 10 ms/task | **Non-interference**: each fast group's mean job completion time in the contended run ≤ 2.0× its *own* baseline figure. **Cross-group fairness**: the three fast groups within 1.8× of each other. Plus exactly-once, pinned isolation, full workload per worker, and the publication-run occupancy proxy ≤ `B/2` |
 | `the_full_scale_workload_is_dispatched_exactly_once` | **16 RG × 32 jobs × 128 tasks = 65 536**, 16 pinned + 16 general workers | Exactly-once over all 65 536; pinned isolation; all 16 groups served; drained |
 | `every_finalization_task_follows_its_job_and_is_dispatched_once` | 4 RG × 4 × 16, commit **and** cleanup armed | Each of the 16 finalizations dispatched exactly once with the armed kind; every finalization's assignment ID strictly greater than every regular assignment ID of the same job; no unarmed finalization; the cleanup lane is non-empty |
 | `a_mid_run_session_bump_replays_every_unfinished_task` | 4 RG × 4 × 64, bump at 200 ms | The bump landed before drain; new session ID; coverage of every task; duplicates bounded; no task dispatched three times; drained |
@@ -186,7 +186,7 @@ What remains weak:
 
 - **The absolute numbers are dominated by harness overhead, not by scheduling.** A fast group's 256 tasks represent 256 ms of simulated execution but complete in ~650 ms, so roughly 1.5 ms per dispatch is gRPC and runtime cost in a debug build. The baseline-relative comparison is unaffected — both runs pay the same overhead — but the assertion's sensitivity is: catching a 2.0× slowdown on ~650 ms means catching starvation of more than twice the intrinsic work time, not a subtle one.
 - **The cross-group spread bound of 1.8× is coarse by necessity.** In the *baseline* runs, where all four groups are identical and no slow group exists, the three groups still spread by 1.1–1.6×. A tighter bound would measure harness noise rather than scheduler fairness. Part of that variance is structural: with only two jobs per group, the metric swings by ~33% depending on whether the core drains a group's two jobs concurrently or one after the other, which is itself sensitive to whether a job transiently runs dry and is downgraded. Averaging over more, smaller jobs (8 × 32 instead of 2 × 128, same 256 tasks) was measured to cut the tail from 1.35 to 1.23.
-- **The occupancy half is still a proxy.** The mint-run bound infers queue depth from the order assignments were minted in rather than reading occupancy, because the integration suite is deliberately black-box through gRPC. It is now secondary evidence rather than the scenario's primary argument, but it is still checked against `B/2` where four backlogged groups predict `B/(N+1) ≈ 6`.
+- **The occupancy half is still a proxy.** The publication-run bound infers queue depth from the order assignments were published in rather than reading occupancy, because the integration suite is deliberately black-box through gRPC. It is now secondary evidence rather than the scenario's primary argument, but it is still checked against `B/2` where four backlogged groups predict `B/(N+1) ≈ 6`.
 
 **Other gaps in strength:**
 

@@ -294,7 +294,7 @@ fn make_job_entry(
 
 /// # Returns
 ///
-/// An assignment of `task_id` carrying an ID no assignment the core mints can collide with.
+/// An assignment of `task_id` carrying an ID no assignment the core publishes can collide with.
 fn make_assignment(
     rg_id: ResourceGroupId,
     job_id: JobId,

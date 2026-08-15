@@ -200,7 +200,7 @@ async fn a_stale_hint_on_an_empty_group_consumes_the_hint_and_yields_nothing() -
 }
 
 #[tokio::test]
-async fn next_task_pinned_drops_an_assignment_minted_in_a_stale_session() -> anyhow::Result<()> {
+async fn next_task_pinned_drops_an_assignment_published_in_a_stale_session() -> anyhow::Result<()> {
     const STALE_SESSION_ID: SessionId = DEFAULT_SESSION_ID;
     const CURRENT_SESSION_ID: SessionId = DEFAULT_SESSION_ID + 1;
 
@@ -215,7 +215,8 @@ async fn next_task_pinned_drops_an_assignment_minted_in_a_stale_session() -> any
 }
 
 #[tokio::test]
-async fn next_task_general_drops_an_assignment_minted_in_a_stale_session() -> anyhow::Result<()> {
+async fn next_task_general_drops_an_assignment_published_in_a_stale_session() -> anyhow::Result<()>
+{
     const STALE_SESSION_ID: SessionId = DEFAULT_SESSION_ID;
     const CURRENT_SESSION_ID: SessionId = DEFAULT_SESSION_ID + 1;
 

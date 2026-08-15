@@ -216,7 +216,7 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
         Ok(())
     }
 
-    /// Discards every piece of state minted in a session older than `new_session_id`.
+    /// Discards every piece of state published in a session older than `new_session_id`.
     ///
     /// Clearing the dedup set is load-bearing rather than tidy: storage replays its ready tasks
     /// after a bump, and a stale dedup entry would drop a replayed task while the registry no
@@ -241,7 +241,7 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
         self.global_queue.drain();
     }
 
-    /// Drains the reschedule queue, dropping assignments minted in a session other than
+    /// Drains the reschedule queue, dropping assignments published in a session other than
     /// `session_id`.
     ///
     /// # Returns

@@ -154,7 +154,7 @@ impl DispatchService {
                     rg_id = ? reader.rg_id(),
                     hint_session_id = reader.session_id(),
                     current_session_id,
-                    "Discarding a hint minted in a stale session."
+                    "Discarding a hint published in a stale session."
                 );
                 continue;
             }
