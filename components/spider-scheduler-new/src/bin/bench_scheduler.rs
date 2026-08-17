@@ -282,28 +282,22 @@ fn spawn_core(
     session_manager: &SessionManager,
     cancellation_token: CancellationToken,
 ) -> JoinHandle<Result<Vec<TickSample>, CoreError>> {
-    let core_config = case.core_config();
-    let num_ticks = expected_tick_count(case);
-    let storage = storage.clone();
-    let rg_table = rg_table.clone();
-    let global_queue = global_queue.clone();
-    let session_manager = session_manager.clone();
     // The benchmark never replays a lost assignment, so the write side is dropped straight away;
     // the core reads the resulting closed queue exactly as it reads an empty one.
     let (_, reschedule_queue_reader) = unbounded_channel::<TaskAssignment>();
 
-    run_core_on_dedicated_thread_with_tick_samples(move || {
+    run_core_on_dedicated_thread_with_tick_samples(
         Core::new(
-            core_config,
-            storage,
-            rg_table,
-            global_queue,
-            session_manager,
+            case.core_config(),
+            storage.clone(),
+            rg_table.clone(),
+            global_queue.clone(),
+            session_manager.clone(),
             reschedule_queue_reader,
             cancellation_token,
         )
-        .with_tick_sample_capacity(num_ticks)
-    })
+        .with_tick_sample_capacity(expected_tick_count(case)),
+    )
 }
 
 /// Waits until every task of the run has been reported complete or `timeout` expires, reporting

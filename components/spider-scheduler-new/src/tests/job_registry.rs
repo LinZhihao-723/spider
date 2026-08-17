@@ -1,18 +1,15 @@
-//! Unit tests for the job registry and the entries it shares with the scheduling units.
+//! Unit tests for the job registry: what a key resolves to, and when it stops resolving.
 
 use std::collections::VecDeque;
 
 use super::make_job_entry;
 use crate::core::DOWNGRADE_LIVES;
-use crate::error::JobEntryError;
+use crate::job_registry::JobEntry;
+use crate::job_registry::JobKey;
 use crate::job_registry::JobRegistry;
 use crate::job_registry::UpsertOutcome;
 use crate::types::JobId;
-use crate::types::ResourceGroupId;
 use crate::types::TaskIndex;
-
-/// The resource group every job in this module belongs to.
-const RG_ID: ResourceGroupId = ResourceGroupId::from(7);
 
 /// The job every single-job test registers.
 const JOB_ID: JobId = JobId::from(3);
@@ -21,17 +18,17 @@ const JOB_ID: JobId = JobId::from(3);
 fn upsert_registers_a_new_job_and_appends_to_an_existing_one() -> anyhow::Result<()> {
     let mut registry = JobRegistry::new();
 
-    let entry = make_job_entry(&mut registry, JOB_ID, RG_ID, 2)?;
-    assert_eq!(entry.job_id(), JOB_ID);
-    assert_eq!(entry.rg_id(), RG_ID);
+    let job_key = make_job_entry(&mut registry, JOB_ID, 2)?;
+    assert_eq!(job_id_of(&mut registry, job_key), Some(JOB_ID));
     assert_eq!(registry.len(), 1);
 
-    let outcome = registry.upsert(JOB_ID, RG_ID, vec![7, 8]);
+    let outcome = registry.upsert(JOB_ID, vec![7, 8]);
     assert!(matches!(outcome, UpsertOutcome::Exist));
     assert_eq!(registry.len(), 1);
 
+    let entry = entry_of(&mut registry, job_key);
     let mut dispatched: Vec<TaskIndex> = Vec::new();
-    while let Some(task_index) = entry.get_next_task()? {
+    while let Some(task_index) = entry.get_next_task() {
         dispatched.push(task_index);
     }
     assert_eq!(dispatched, vec![0, 1, 7, 8]);
@@ -41,70 +38,79 @@ fn upsert_registers_a_new_job_and_appends_to_an_existing_one() -> anyhow::Result
 #[test]
 fn upsert_keeps_the_scheduling_position_of_an_existing_job() -> anyhow::Result<()> {
     let mut registry = JobRegistry::new();
-    let entry = make_job_entry(&mut registry, JOB_ID, RG_ID, 1)?;
+    let job_key = make_job_entry(&mut registry, JOB_ID, 1)?;
 
-    let outcome = registry.upsert(JOB_ID, RG_ID, vec![1]);
+    let outcome = registry.upsert(JOB_ID, vec![1]);
     let UpsertOutcome::Exist = outcome else {
-        anyhow::bail!("re-registering a job must not hand out a second entry to place");
+        anyhow::bail!("re-registering a job must not hand out a second key to place");
     };
 
-    // The entry the registry appended to must be the one the scheduling unit already holds.
-    assert_eq!(entry.get_next_task()?, Some(0));
-    assert_eq!(entry.get_next_task()?, Some(1));
-    assert_eq!(entry.get_next_task()?, None);
+    // The entry the registry appended to must be the one the scheduling unit's key resolves to.
+    let entry = entry_of(&mut registry, job_key);
+    assert_eq!(entry.get_next_task(), Some(0));
+    assert_eq!(entry.get_next_task(), Some(1));
+    assert_eq!(entry.get_next_task(), None);
     Ok(())
 }
 
 #[test]
-fn finalize_and_remove_marks_the_entry_and_drops_the_registration() -> anyhow::Result<()> {
+fn remove_by_job_id_hands_back_the_entry_and_drops_the_registration() -> anyhow::Result<()> {
     let mut registry = JobRegistry::new();
-    let entry = make_job_entry(&mut registry, JOB_ID, RG_ID, 2)?;
-    assert!(!entry.is_finalized());
+    let job_key = make_job_entry(&mut registry, JOB_ID, 2)?;
 
-    let removed = registry
-        .finalize_and_remove(JOB_ID)
+    let mut removed = registry
+        .remove_by_job_id(JOB_ID)
         .expect("the registered job is removed by its finalization");
     assert_eq!(removed.job_id(), JOB_ID);
-    assert!(removed.is_finalized());
-    assert!(entry.is_finalized());
+    assert_eq!(removed.take_ready_tasks(), VecDeque::from(vec![0, 1]));
     assert_eq!(registry.len(), 0);
 
-    assert!(registry.finalize_and_remove(JOB_ID).is_none());
+    assert_eq!(job_id_of(&mut registry, job_key), None);
+    assert!(registry.remove_by_job_id(JOB_ID).is_none());
     Ok(())
 }
 
 #[test]
-fn get_next_task_reports_a_finalized_job() -> anyhow::Result<()> {
+fn a_removed_jobs_key_never_resolves_to_a_later_job() -> anyhow::Result<()> {
     let mut registry = JobRegistry::new();
-    let entry = make_job_entry(&mut registry, JOB_ID, RG_ID, 2)?;
-    assert_eq!(entry.get_next_task()?, Some(0));
-
+    let stale_key = make_job_entry(&mut registry, JOB_ID, 2)?;
     registry
-        .finalize_and_remove(JOB_ID)
+        .remove_by_job_id(JOB_ID)
         .expect("the registered job is removed by its finalization");
 
-    assert_eq!(entry.get_next_task(), Err(JobEntryError::Finalized));
-    assert!(entry.has_ready_task());
+    // The freed slot is offered to the next job registered, which is exactly the case a plain
+    // index could not distinguish from the removed one.
+    let next_job_id = JobId::from(JOB_ID.get() + 1);
+    let next_key = make_job_entry(&mut registry, next_job_id, 1)?;
+    assert_eq!(job_id_of(&mut registry, next_key), Some(next_job_id));
+    assert_eq!(job_id_of(&mut registry, stale_key), None);
     Ok(())
 }
 
 #[test]
 fn inserting_tasks_restores_the_downgrade_budget() -> anyhow::Result<()> {
     let mut registry = JobRegistry::new();
-    let entry = make_job_entry(&mut registry, JOB_ID, RG_ID, 1)?;
-    assert_eq!(entry.downgrade_counter(), DOWNGRADE_LIVES);
+    let job_key = make_job_entry(&mut registry, JOB_ID, 1)?;
+    assert_eq!(
+        entry_of(&mut registry, job_key).downgrade_counter(),
+        DOWNGRADE_LIVES
+    );
 
     for _ in 0..=DOWNGRADE_LIVES {
-        entry.decrement_downgrade_counter();
+        entry_of(&mut registry, job_key).decrement_downgrade_counter();
     }
-    assert_eq!(entry.downgrade_counter(), 0);
+    assert_eq!(entry_of(&mut registry, job_key).downgrade_counter(), 0);
 
     assert!(matches!(
-        registry.upsert(JOB_ID, RG_ID, vec![1]),
+        registry.upsert(JOB_ID, vec![1]),
         UpsertOutcome::Exist
     ));
-    assert_eq!(entry.downgrade_counter(), DOWNGRADE_LIVES);
+    assert_eq!(
+        entry_of(&mut registry, job_key).downgrade_counter(),
+        DOWNGRADE_LIVES
+    );
 
+    let entry = entry_of(&mut registry, job_key);
     entry.decrement_downgrade_counter();
     entry.reset_downgrade_counter();
     assert_eq!(entry.downgrade_counter(), DOWNGRADE_LIVES);
@@ -112,38 +118,61 @@ fn inserting_tasks_restores_the_downgrade_budget() -> anyhow::Result<()> {
 }
 
 #[test]
-fn take_ready_tasks_empties_a_job_without_finalizing_it() -> anyhow::Result<()> {
+fn take_ready_tasks_empties_a_job_without_removing_it() -> anyhow::Result<()> {
     let mut registry = JobRegistry::new();
-    let entry = make_job_entry(&mut registry, JOB_ID, RG_ID, 3)?;
+    let job_key = make_job_entry(&mut registry, JOB_ID, 3)?;
 
+    let entry = entry_of(&mut registry, job_key);
     assert_eq!(entry.take_ready_tasks(), VecDeque::from(vec![0, 1, 2]));
     assert!(!entry.has_ready_task());
-    assert_eq!(entry.get_next_task()?, None);
+    assert_eq!(entry.get_next_task(), None);
     assert_eq!(entry.take_ready_tasks(), VecDeque::new());
+
+    assert_eq!(job_id_of(&mut registry, job_key), Some(JOB_ID));
+    assert_eq!(registry.len(), 1);
     Ok(())
 }
 
 #[test]
 fn remove_and_clear_drop_the_registered_jobs() -> anyhow::Result<()> {
     let mut registry = JobRegistry::new();
-    let entry = make_job_entry(&mut registry, JOB_ID, RG_ID, 1)?;
+    let job_key = make_job_entry(&mut registry, JOB_ID, 1)?;
     let other_job_id = JobId::from(JOB_ID.get() + 1);
-    make_job_entry(&mut registry, other_job_id, RG_ID, 1)?;
+    let other_job_key = make_job_entry(&mut registry, other_job_id, 1)?;
     assert_eq!(registry.len(), 2);
 
     let removed = registry
-        .remove(JOB_ID)
+        .remove(job_key)
         .expect("the registered job is removed by its retirement");
     assert_eq!(removed.job_id(), JOB_ID);
     assert_eq!(registry.len(), 1);
-    assert!(registry.remove(JOB_ID).is_none());
+    assert!(registry.remove(job_key).is_none());
 
-    // Retirement drops the registry's co-ownership only; the entry a scheduling unit still holds
-    // keeps working.
-    assert!(!entry.is_finalized());
-    assert_eq!(entry.get_next_task()?, Some(0));
+    // Removing one job leaves every other key resolving as it did.
+    assert_eq!(job_id_of(&mut registry, other_job_key), Some(other_job_id));
 
     registry.clear();
     assert_eq!(registry.len(), 0);
+    assert_eq!(job_id_of(&mut registry, other_job_key), None);
     Ok(())
+}
+
+/// # Returns
+///
+/// The ID of the job `job_key` refers to, or [`None`] if the key no longer resolves.
+fn job_id_of(registry: &mut JobRegistry, job_key: JobKey) -> Option<JobId> {
+    registry.get_mut(job_key).map(|entry| entry.job_id())
+}
+
+/// # Returns
+///
+/// The entry `job_key` refers to.
+///
+/// # Panics
+///
+/// Panics if the key no longer resolves.
+fn entry_of(registry: &mut JobRegistry, job_key: JobKey) -> &mut JobEntry {
+    registry
+        .get_mut(job_key)
+        .expect("the job is still registered")
 }

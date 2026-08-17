@@ -1,17 +1,18 @@
 //! The core-private scheduling state of a single resource group.
 //!
 //! The unit owns everything the core decides with for one group -- its job lists, its pending
-//! finalizations, and the write side of its dispatch queue -- so the decision loop can hold a
-//! mutable borrow of one group without touching any other.
+//! finalizations, and the write side of its dispatch queue. The jobs themselves are owned by the
+//! job registry, so every scheduling position here holds a [`JobKey`] and resolves it against the
+//! registry the core hands in; a key that fails to resolve is a job that has been removed.
 
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 
 use crate::core::TaskAssignmentIdIssuer;
 use crate::dispatch_queue::GlobalDispatchQueue;
-use crate::error::JobEntryError;
 use crate::error::MakeAssignmentError;
-use crate::job_registry::SharedJobEntry;
+use crate::job_registry::JobKey;
+use crate::job_registry::JobRegistry;
 use crate::resource_group::RgDispatchQueueEndpoints;
 use crate::resource_group::RgDispatchQueueReader;
 use crate::types::FinalizeKind;
@@ -28,10 +29,10 @@ pub struct RgSchedulingUnit {
     pub rg_id: ResourceGroupId,
 
     /// The jobs assignments are currently drawn from, rotated over by [`Self::rr_arm`].
-    pub active_jobs: Vec<SharedJobEntry>,
+    pub active_jobs: Vec<JobKey>,
 
     /// The jobs waiting for a slot in [`Self::active_jobs`].
-    pub pending_jobs: VecDeque<SharedJobEntry>,
+    pub pending_jobs: VecDeque<JobKey>,
 
     /// The index into [`Self::active_jobs`] the next regular task is drawn from.
     pub rr_arm: usize,
@@ -44,7 +45,7 @@ pub struct RgSchedulingUnit {
     num_buffered_cleanups: usize,
     dispatch_queue_sender: async_channel::Sender<TaskAssignment>,
     reader: RgDispatchQueueReader,
-    downgrade_buffer: Vec<SharedJobEntry>,
+    downgrade_buffer: Vec<JobKey>,
     active_job_list_capacity: usize,
 }
 
@@ -108,11 +109,11 @@ impl RgSchedulingUnit {
     }
 
     /// Gives a newly registered job its scheduling position in this group.
-    pub fn place_new_job(&mut self, entry: SharedJobEntry) {
+    pub fn place_new_job(&mut self, job_key: JobKey) {
         if self.active_jobs.len() < self.active_job_list_capacity {
-            self.active_jobs.push(entry);
+            self.active_jobs.push(job_key);
         } else {
-            self.pending_jobs.push_back(entry);
+            self.pending_jobs.push_back(job_key);
         }
     }
 
@@ -120,12 +121,16 @@ impl RgSchedulingUnit {
     ///
     /// Pending jobs that yield nothing spend a downgrade life, and are collected into
     /// `jobs_to_retire` once they have none left.
-    pub fn promote_pending_jobs(&mut self, jobs_to_retire: &mut Vec<JobId>) {
+    pub fn promote_pending_jobs(
+        &mut self,
+        job_registry: &mut JobRegistry,
+        jobs_to_retire: &mut Vec<JobKey>,
+    ) {
         while self.active_jobs.len() < self.active_job_list_capacity {
-            let Some(entry) = self.pop_promotable_job(jobs_to_retire) else {
+            let Some(job_key) = self.pop_promotable_job(job_registry, jobs_to_retire) else {
                 break;
             };
-            self.active_jobs.push(entry);
+            self.active_jobs.push(job_key);
         }
     }
 
@@ -133,6 +138,10 @@ impl RgSchedulingUnit {
     ///
     /// `free` is the tick's remaining free space in the whole dispatch buffer, read but not
     /// modified here -- the caller decrements it once the assignment is published.
+    ///
+    /// The unit and the job arena are borrowed mutably at the same time, which is why this is a
+    /// method on the unit rather than on the core: the caller destructures the core's fields so
+    /// that the two borrows name different fields and the borrow checker accepts them.
     ///
     /// # Returns
     ///
@@ -152,7 +161,8 @@ impl RgSchedulingUnit {
         session_id: SessionId,
         id_issuer: &TaskAssignmentIdIssuer,
         global_queue: &GlobalDispatchQueue,
-        jobs_to_retire: &mut Vec<JobId>,
+        job_registry: &mut JobRegistry,
+        jobs_to_retire: &mut Vec<JobKey>,
     ) -> Result<(JobId, TaskId), MakeAssignmentError> {
         if !self.has_schedulable_task() {
             return Err(MakeAssignmentError::NoTask);
@@ -161,24 +171,28 @@ impl RgSchedulingUnit {
             return Err(MakeAssignmentError::DispatchQueueFull);
         }
 
-        let taken = if let Some((job_id, kind)) = self.pop_finalization() {
-            TakenTask::Finalization(job_id, kind)
+        let (taken, job_id, task_id) = if let Some((job_id, kind)) = self.pop_finalization() {
+            (
+                TakenTask::Finalization(job_id, kind),
+                job_id,
+                TaskId::from(kind),
+            )
         } else {
-            let (entry, task_index) = self
-                .take_regular_task(jobs_to_retire)
+            let (job_key, job_id, task_index) = self
+                .take_regular_task(job_registry, jobs_to_retire)
                 .ok_or(MakeAssignmentError::NoTask)?;
-            TakenTask::Regular(entry, task_index)
-        };
-        let (job_id, task_id) = match &taken {
-            TakenTask::Finalization(job_id, kind) => (*job_id, TaskId::from(*kind)),
-            TakenTask::Regular(entry, task_index) => (entry.job_id(), TaskId::Index(*task_index)),
+            (
+                TakenTask::Regular(job_key, task_index),
+                job_id,
+                TaskId::Index(task_index),
+            )
         };
 
         // The task is already out of the structure that held it, so a rejected publication has to
         // put it back: the core removes it from the dedup set only on success, and an entry that is
         // in neither place can never be re-admitted.
         if let Err(e) = self.publish(job_id, task_id, session_id, id_issuer, global_queue) {
-            self.restore(taken);
+            self.restore(&taken, job_registry);
             return Err(e);
         }
         Ok((job_id, task_id))
@@ -186,10 +200,12 @@ impl RgSchedulingUnit {
 
     /// Returns every job buffered for downgrade to the head of the pending job queue, with its
     /// downgrade budget restored.
-    pub fn apply_downgrades(&mut self) {
-        for entry in std::mem::take(&mut self.downgrade_buffer) {
-            entry.reset_downgrade_counter();
-            self.pending_jobs.push_front(entry);
+    pub fn apply_downgrades(&mut self, job_registry: &mut JobRegistry) {
+        for job_key in std::mem::take(&mut self.downgrade_buffer) {
+            if let Some(entry) = job_registry.get_mut(job_key) {
+                entry.reset_downgrade_counter();
+            }
+            self.pending_jobs.push_front(job_key);
         }
     }
 
@@ -205,13 +221,17 @@ impl RgSchedulingUnit {
     }
 
     /// Returns a task whose publication was rejected to the structure it was taken from.
-    fn restore(&mut self, taken: TakenTask) {
-        match taken {
+    fn restore(&mut self, taken: &TakenTask, job_registry: &mut JobRegistry) {
+        match *taken {
             TakenTask::Finalization(job_id, kind) => {
                 self.finalize_queue.push_front((job_id, kind));
                 self.count_finalization(kind);
             }
-            TakenTask::Regular(entry, task_index) => entry.restore_task(task_index),
+            TakenTask::Regular(job_key, task_index) => {
+                if let Some(entry) = job_registry.get_mut(job_key) {
+                    entry.restore_task(task_index);
+                }
+            }
         }
     }
 
@@ -240,18 +260,24 @@ impl RgSchedulingUnit {
     ///
     /// # Returns
     ///
-    /// The job entry the task was drawn from and the task index to dispatch, or [`None`] if no
-    /// active or pending job yields a task.
+    /// A tuple on success, containing:
+    ///
+    /// * The key of the job the task was drawn from.
+    /// * That job's ID.
+    /// * The task index to dispatch.
+    ///
+    /// [`None`] is returned if no active or pending job yields a task.
     fn take_regular_task(
         &mut self,
-        jobs_to_retire: &mut Vec<JobId>,
-    ) -> Option<(SharedJobEntry, TaskIndex)> {
+        job_registry: &mut JobRegistry,
+        jobs_to_retire: &mut Vec<JobKey>,
+    ) -> Option<(JobKey, JobId, TaskIndex)> {
         let mut remaining_visits = self.active_jobs.len();
         loop {
             if self.active_jobs.is_empty() {
-                let entry = self.pop_promotable_job(jobs_to_retire)?;
+                let job_key = self.pop_promotable_job(job_registry, jobs_to_retire)?;
                 self.rr_arm = 0;
-                self.active_jobs.push(entry);
+                self.active_jobs.push(job_key);
                 remaining_visits = 1;
             } else if 0 == remaining_visits {
                 return None;
@@ -261,29 +287,28 @@ impl RgSchedulingUnit {
             if self.rr_arm >= self.active_jobs.len() {
                 self.rr_arm = 0;
             }
-            let entry = self.active_jobs[self.rr_arm].clone();
-            match entry.get_next_task() {
-                Ok(Some(task_index)) => {
-                    self.rr_arm += 1;
-                    return Some((entry, task_index));
+            let job_key = self.active_jobs[self.rr_arm];
+            let Some(entry) = job_registry.get_mut(job_key) else {
+                if self.swap_in_pending_job(job_registry, jobs_to_retire) {
+                    remaining_visits += 1;
                 }
-                Ok(None) => {
-                    entry.decrement_downgrade_counter();
-                    if 0 == entry.downgrade_counter() {
-                        self.downgrade_buffer.push(entry);
-                        if self.swap_in_pending_job(jobs_to_retire) {
-                            remaining_visits += 1;
-                        }
-                    } else {
-                        self.rr_arm += 1;
-                    }
-                }
-                Err(JobEntryError::Finalized) => {
-                    if self.swap_in_pending_job(jobs_to_retire) {
+                continue;
+            };
+            let Some(task_index) = entry.get_next_task() else {
+                entry.decrement_downgrade_counter();
+                if 0 == entry.downgrade_counter() {
+                    self.downgrade_buffer.push(job_key);
+                    if self.swap_in_pending_job(job_registry, jobs_to_retire) {
                         remaining_visits += 1;
                     }
+                } else {
+                    self.rr_arm += 1;
                 }
-            }
+                continue;
+            };
+            let job_id = entry.job_id();
+            self.rr_arm += 1;
+            return Some((job_key, job_id, task_index));
         }
     }
 
@@ -292,9 +317,13 @@ impl RgSchedulingUnit {
     /// # Returns
     ///
     /// Whether a pending job took the vacated slot. When none did, the slot itself is removed.
-    fn swap_in_pending_job(&mut self, jobs_to_retire: &mut Vec<JobId>) -> bool {
-        if let Some(entry) = self.pop_promotable_job(jobs_to_retire) {
-            self.active_jobs[self.rr_arm] = entry;
+    fn swap_in_pending_job(
+        &mut self,
+        job_registry: &mut JobRegistry,
+        jobs_to_retire: &mut Vec<JobKey>,
+    ) -> bool {
+        if let Some(job_key) = self.pop_promotable_job(job_registry, jobs_to_retire) {
+            self.active_jobs[self.rr_arm] = job_key;
             true
         } else {
             self.active_jobs.swap_remove(self.rr_arm);
@@ -305,29 +334,33 @@ impl RgSchedulingUnit {
     /// Pops pending jobs until one with a buffered ready task is found, examining each queued job
     /// at most once.
     ///
-    /// A job found finalized is discarded outright; one that yields nothing spends a downgrade life
-    /// and goes to the back of the queue, or is collected into `jobs_to_retire` if it has none
-    /// left.
+    /// A key that no longer resolves belongs to a job that has been removed from the registry and
+    /// is discarded outright; a job that yields nothing spends a downgrade life and goes to the
+    /// back of the queue, or is collected into `jobs_to_retire` if it has none left.
     ///
     /// # Returns
     ///
-    /// The promotable job, or [`None`] if no pending job yields a task.
-    fn pop_promotable_job(&mut self, jobs_to_retire: &mut Vec<JobId>) -> Option<SharedJobEntry> {
+    /// The key of the promotable job, or [`None`] if no pending job yields a task.
+    fn pop_promotable_job(
+        &mut self,
+        job_registry: &mut JobRegistry,
+        jobs_to_retire: &mut Vec<JobKey>,
+    ) -> Option<JobKey> {
         let mut remaining_visits = self.pending_jobs.len();
         while 0 != remaining_visits {
             remaining_visits -= 1;
-            let entry = self.pending_jobs.pop_front()?;
-            if entry.is_finalized() {
+            let job_key = self.pending_jobs.pop_front()?;
+            let Some(entry) = job_registry.get_mut(job_key) else {
                 continue;
-            }
+            };
             if entry.has_ready_task() {
-                return Some(entry);
+                return Some(job_key);
             }
             if 0 == entry.downgrade_counter() {
-                jobs_to_retire.push(entry.job_id());
+                jobs_to_retire.push(job_key);
             } else {
                 entry.decrement_downgrade_counter();
-                self.pending_jobs.push_back(entry);
+                self.pending_jobs.push_back(job_key);
             }
         }
         None
@@ -392,5 +425,5 @@ enum TakenTask {
     Finalization(JobId, FinalizeKind),
 
     /// A regular task, taken out of the job entry it belongs to.
-    Regular(SharedJobEntry, TaskIndex),
+    Regular(JobKey, TaskIndex),
 }

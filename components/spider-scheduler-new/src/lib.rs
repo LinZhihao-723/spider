@@ -68,7 +68,6 @@ pub use crate::bench::WorkerResults;
 pub use crate::config::CoreConfig;
 pub use crate::error::CoreError;
 pub use crate::error::HarnessError;
-pub use crate::error::JobEntryError;
 pub use crate::error::MakeAssignmentError;
 pub use crate::error::StorageClientError;
 pub use crate::session::SessionManager;

@@ -46,6 +46,7 @@ const PUBLISH_DELAY: Duration = Duration::from_millis(5);
 /// One resource group's publishing side, wired to the structures a test inspects.
 struct PublisherFixture {
     unit: RgSchedulingUnit,
+    registry: JobRegistry,
     rg_table: ResourceGroupTable,
     global_queue: GlobalDispatchQueue,
     id_issuer: TaskAssignmentIdIssuer,
@@ -67,9 +68,10 @@ impl PublisherFixture {
         let rg_table = ResourceGroupTable::new();
         let mut unit = make_unit(&rg_table, RG_ID, DEFAULT_SESSION_ID, 1);
         let mut registry = JobRegistry::new();
-        unit.place_new_job(make_job_entry(&mut registry, JOB_ID, RG_ID, num_tasks)?);
+        unit.place_new_job(make_job_entry(&mut registry, JOB_ID, num_tasks)?);
         Ok(Self {
             unit,
+            registry,
             rg_table,
             global_queue: GlobalDispatchQueue::new(),
             id_issuer: TaskAssignmentIdIssuer::new(),
@@ -90,6 +92,7 @@ impl PublisherFixture {
             DEFAULT_SESSION_ID,
             &self.id_issuer,
             &self.global_queue,
+            &mut self.registry,
             &mut jobs_to_retire,
         )?;
         Ok(())

@@ -12,6 +12,7 @@ The scheduler core is a single-threaded, tick-based loop that drains ready tasks
 - **Correct handling of both dispatch modes.** A resource-group-dedicated execution manager dispatches only from its own group, while general execution managers serve every group with near-round-robin fairness — and every assignment remains reachable by a general execution manager, so a group whose dedicated managers are absent is still fully served.
 - **Auto-balancing buffer occupancy.** The dispatch queue can never be filled by a single resource group. When a new group arrives it always finds room to publish assignments, without any capacity being statically reserved for it.
 - **An improved job lifecycle.** Active → pending → retire replaces the current round-robin implementation's deferred retirement, giving a job several chances to be refilled before being dropped.
+- **A core any runtime can spawn.** The core owns its scheduling state outright, in arenas rather than through shared handles, so the core future is `Send` and needs no dedicated thread with a `LocalSet` ([§2](#2-components)).
 - **Room to grow.** The serialized design is sized for a small constant number of resource groups, which meets the CLP package integration requirement, and leaves per-group parallelization available should that change.
 
 ### 1.2 Structural properties
@@ -36,7 +37,9 @@ Two properties drive the structure:
 | Reschedule queue | EM registry writes, core reads | — |
 | Session manager | spider-execution-manager | **yes** |
 
-Everything the dispatch service touches is `Send + Sync`. Everything else is core-private and single-threaded, which is what permits `Rc<RefCell<…>>` in the scheduling structures.
+Everything the dispatch service touches is `Send + Sync`. Everything else is core-private, and the core **owns it outright**: job entries live in a generational arena ([§3.3](#33-job-registry)) and resource group scheduling units in an append-only `Vec` ([§3.4](#34-resource-group-registry)). Scheduling positions — an RG's active job list, its pending job queue, the per-tick downgrade buffer, the active RG list — hold keys and indices into those arenas, never co-owning handles.
+
+The core is single-threaded by construction, but nothing in it is single-threaded by *type*: there is no `Rc` and no `RefCell` anywhere in the scheduling structures. The core future is therefore `Send`, and the existing `spider-scheduler` runtime spawns it like any other core, with no dedicated thread and no `LocalSet`. That is the point of the arena ownership model; the properties below are what it costs and what it buys.
 
 ## 3. Data structures
 
@@ -44,7 +47,9 @@ Everything the dispatch service touches is `Send + Sync`. Everything else is cor
 
 `HashSet<(JobId, TaskId)>`. Deduplicates tasks read from the inbound queue and the reschedule queue.
 
-An entry is inserted when a task enters the job registry and **removed when its assignment is published to a dispatch queue**. The set therefore tracks what is *currently buffered in the core*, not what has ever been seen — which is what allows a rescheduled assignment to be re-admitted after the execution manager that held it was lost.
+An entry is inserted when a task enters the job registry and **removed when its assignment is published to a dispatch queue**, or when the job entry still holding it is removed from the registry. The set therefore tracks what is *currently buffered in the core*, not what has ever been seen — which is what allows a rescheduled assignment to be re-admitted after the execution manager that held it was lost.
+
+The second removal path is why the job registry hands a removed entry back **by value** ([§3.3](#33-job-registry)): the entry's remaining `ready_tasks` are drained straight out of the set in the same operation, with no borrow to release first.
 
 ### 3.2 Finalized job table
 
@@ -54,48 +59,59 @@ Consulted when upserting **regular** tasks into the job registry: a regular task
 
 ### 3.3 Job registry
 
-`HashMap<JobId, SharedJobEntry>`.
+A generational arena of job entries, plus a secondary index from job ID to key.
 
 ```rust
+slotmap::new_key_type! { pub struct JobKey; }
+
+struct JobRegistry {
+    jobs:      SlotMap<JobKey, JobEntry>,
+    by_job_id: HashMap<JobId, JobKey>,
+}
+
 struct JobEntry {
     job_id: JobId,
     rg_id: ResourceGroupId,
     ready_tasks: VecDeque<TaskIndex>,   // no duplicates
     downgrade_counter: u32,
 }
-
-// Rc<…> — co-owned by the registry and by exactly one scheduling position
-// (an RG's active job list, its pending job queue, or a per-tick downgrade buffer).
-struct SharedJobEntry(Rc<SharedJobEntryInner>);
-
-struct SharedJobEntryInner {
-    // Outside the RefCell so that `finalize()` and `is_finalized()` cannot panic:
-    // Cell mutates through `&self` with no borrow tracking. Both are called from
-    // positions where a conflicting guard may plausibly be live — `finalize_and_remove`
-    // in step 2, and the finalized check while scanning `pending_jobs` in step 4.
-    finalized: Cell<bool>,
-    inner: RefCell<JobEntry>,
-}
 ```
 
-**Methods on `SharedJobEntry`:**
+The registry is the sole owner of every entry. A scheduling position — an RG's active job list, its pending job queue, or the per-tick downgrade buffer — holds a `JobKey` and resolves it against the arena when it needs the entry. Exactly one position holds any given key ([§8.3](#83-other-invariants)); `by_job_id` is the registry's own index, not a second position.
+
+**Methods on `JobEntry`:**
 
 - `insert_tasks(task_indices: Vec<TaskIndex>)` — appends ready tasks and resets `downgrade_counter` to `DOWNGRADE_LIVES`.
-- `finalize()` — sets the `finalized` flag.
-- `get_next_task() -> Result<Option<TaskIndex>, JobEntryError>` — `Ok(Some)` when a task is available, `Ok(None)` when the queue is empty, `Err` when the job is finalized (no further regular task may be scheduled).
+- `get_next_task() -> Option<TaskIndex>` — the next ready task, or `None` when the queue is empty.
 
 **Methods on the registry:**
 
-- `upsert(job_id, task_indices) -> UpsertOutcome` — `Exist` or `New(SharedJobEntry)`.
-- `finalize_and_remove(job_id) -> Option<SharedJobEntry>`
-- `remove(job_id) -> Option<SharedJobEntry>`
+- `upsert(job_id, rg_id, task_indices) -> UpsertOutcome` — `Exist` or `New(JobKey)`.
+- `get_mut(key) -> Option<&mut JobEntry>` — `None` means the job is gone.
+- `remove_by_job_id(job_id) -> Option<JobEntry>` — used by step 2 to finalize.
+- `remove(key) -> Option<JobEntry>` — used by step 5 to retire.
 - `clear()`
+
+Both removals drop the `by_job_id` index entry and return the `JobEntry` **by value**, so the caller drains the returned entry's remaining `ready_tasks` straight out of the global task set ([§3.1](#31-global-task-set)) without holding a borrow on the registry.
 
 `downgrade_counter` governs retirement and is described in [§5.5](#55-promotion-downgrade-and-retirement). `DOWNGRADE_LIVES` is a compile-time constant, currently `1`.
 
+#### Why there is no `finalized` flag
+
+Earlier revisions carried a `finalized: Cell<bool>` on each shared entry, deliberately placed outside the entry's `RefCell` so that setting and reading it could not panic against a live borrow guard. Three mechanisms — the flag, the entry's removal from the registry, and `get_next_task`'s error variant — all encoded the same fact. The arena collapses them into one: **the key no longer resolves**.
+
+Every use of the flag was exactly that statement.
+
+- Step 2 marked an entry finalized and removed it from the registry. It now calls `remove_by_job_id`, which is the whole operation; there is nothing left to mark.
+- Step 4's regular-task path tested the active job for finalization before scheduling from it. It now calls `get_mut` and treats `None` as the finalized signal.
+- Promotion scanned `pending_jobs` discarding finalized jobs. Same: a key that fails to resolve is a job that is gone, and is dropped from the queue.
+- `get_next_task` returned `Err` for a finalized job so no further regular task could be dispatched. A caller that cannot obtain the entry cannot call it at all, so the variant has nothing left to report and the method returns a plain `Option`.
+
+This is why job entries need **generational** keys rather than plain indices. A scheduling position is *expected* to hold a key to an entry that step 2 has already removed, and dereferencing it afterwards is how the position discovers the removal — the stale dereference is the mechanism, not a bug to be avoided. With a plain index the arena would be free to hand the same slot to the next job created, and that scan would then read a live but unrelated entry: it would schedule tasks under another job's position and swap the wrong entry out of the active list, silently and with no failure to observe. A generation makes the same lookup return `None`, which is the answer the scanner wanted.
+
 ### 3.4 Resource group registry
 
-Split into a shared part and a core-private part. This split is what keeps `Rc<RefCell<…>>` out of anything crossing a thread boundary.
+Split into a shared part and a core-private part. The shared part is the only thing that crosses a thread boundary; the core-private part never leaves the core.
 
 **Shared — `rg_table: Arc<DashMap<ResourceGroupId, RgDispatchQueueEndpoints>>`**
 
@@ -123,18 +139,21 @@ Methods: `get_dispatch_queue_reader(rg_id)` (create if absent, used by the servi
 **Core-private:**
 
 ```rust
-rg_units:       HashMap<ResourceGroupId, Rc<RefCell<RgSchedulingUnit>>>,
-active_rg_list: Vec<Rc<RefCell<RgSchedulingUnit>>>,
+rg_units:       Vec<RgSchedulingUnit>,            // append-only within a session
+rg_index:       HashMap<ResourceGroupId, usize>,  // consulted only on group creation
+active_rg_list: Vec<usize>,
 last_served_rg: Option<ResourceGroupId>,
 ```
 
-The active list co-owns the scheduling units through `Rc` rather than holding IDs, so the decision loop indexes straight into them without a hash lookup per decision.
+**Append-only invariant.** Within a session, `rg_units` is only ever pushed to. A resource group is never removed individually; the only removal is a wholesale flush on session bump ([§9](#9-session-bump)). Positions in `rg_units` are therefore stable for the lifetime of a session, `rg_index` is consulted only when a group is created, and the decision loop indexes straight into `rg_units` without a hash lookup per decision.
+
+That is also why a plain `Vec` is the right structure here while job entries need a generational arena. The hazard generations guard is index reuse after an individual removal — a stale index resolving to a *different* occupant of the same slot. `rg_units` never removes an individual element, so no index is ever stale while the `Vec` is live, and the only event that invalidates indices invalidates all of them at once. Generational keys would guard a hazard that cannot arise, and would obscure the invariant that the `Vec` type already states. The obligation this pushes onto the session bump is recorded in [§9](#9-session-bump).
 
 ```rust
 struct RgSchedulingUnit {
     rg_id: ResourceGroupId,
-    active_jobs: Vec<SharedJobEntry>,        // capacity: active_job_list_capacity
-    pending_jobs: VecDeque<SharedJobEntry>,
+    active_jobs: Vec<JobKey>,                // capacity: active_job_list_capacity
+    pending_jobs: VecDeque<JobKey>,
     finalize_queue: VecDeque<(JobId, FinalizeKind)>,
     dispatch_queue_sender: async_channel::Sender<TaskAssignment>,
     living_hint: Arc<AtomicUsize>,           // shared with RgDispatchQueueReader
@@ -146,8 +165,6 @@ enum FinalizeKind { Commit, Cleanup }
 ```
 
 `finalize_queue` carries the kind because commit and cleanup dispatch different task IDs.
-
-A resource group is never removed individually. The only removal is a wholesale flush on session bump.
 
 ### 3.5 Global dispatch queue
 
@@ -194,7 +211,7 @@ Build an empty map `rg_updates: HashMap<ResourceGroupId, RgUpdate>` where
 ```rust
 struct RgUpdate {
     finalized: Vec<(JobId, FinalizeKind)>,
-    new_jobs:  Vec<SharedJobEntry>,
+    new_jobs:  Vec<JobKey>,
 }
 ```
 
@@ -202,7 +219,7 @@ struct RgUpdate {
 
 - Skip if already in the finalized job table.
 - Insert into the finalized job table.
-- `finalize_and_remove` the job from the job registry and mark the entry finalized.
+- `remove_by_job_id` the job from the job registry. Drain the returned entry's `ready_tasks` out of the global task set: those tasks were admitted but will never be published, and leaving them in the set would block their re-admission for good. Whatever scheduling position still holds the entry's key learns of the removal the next time it resolves it.
 - Append `(job_id, kind)` to `rg_updates[rg_id].finalized`.
 
 **Regular tasks**, batched by job:
@@ -210,16 +227,16 @@ struct RgUpdate {
 - Skip the whole batch if the job is in the finalized job table.
 - For each task, test the global task set; remove already-present tasks from the batch by swapping with the last element. Order within the batch need not be preserved. Insert the survivors into the global task set.
 - Skip the batch if it is now empty.
-- `upsert` the survivors into the job registry. If the outcome is `New`, append the entry to `rg_updates[rg_id].new_jobs`.
+- `upsert` the survivors into the job registry. If the outcome is `New`, append the key to `rg_updates[rg_id].new_jobs`.
 
 ### 5.3 Step 3 — apply updates to the RG registry
 
 For each entry in `rg_updates`:
 
-- Create the scheduling unit if absent (via `rg_table.get_or_create`, cloning the sender and `living_hint`).
+- Look the group up in `rg_index`. If absent, create the scheduling unit (via `rg_table.get_or_create`, cloning the sender and `living_hint`), push it onto `rg_units`, and record its index in `rg_index`. This is the only place either is written.
 - Append the finalized jobs to `finalize_queue`.
-- Place each new job: append to `active_jobs` if it is below `active_job_list_capacity`, otherwise push to the back of `pending_jobs`.
-- If `is_active` is false, set it and append the unit to `active_rg_list`.
+- Place each new job key: append to `active_jobs` if it is below `active_job_list_capacity`, otherwise push to the back of `pending_jobs`.
+- If `is_active` is false, set it and append the unit's index to `active_rg_list`.
 
 Only newly created job entries need placement: an entry that already existed is by construction already held by an active resource group, in either its active list or its pending queue.
 
@@ -227,11 +244,11 @@ Only newly created job entries need placement: an entry that already existed is 
 
 This is the scheduling policy. The active RG list is **not** modified during the step; a per-tick copy `rg_rr_list` is used, and deactivations are buffered and applied at the end.
 
-**a. Set up.** Create `jobs_to_retire: Vec<JobId>`.
+**a. Set up.** Destructure the core's fields — `rg_units`, the job registry, the global task set, the global dispatch queue writer — into separate `&mut` bindings, so the step's inner operations borrow disjoint parts of the core rather than the whole of it. See [`try_make_assignment`](#try_make_assignment) below. Create `jobs_to_retire: Vec<JobKey>`.
 
 **b. Single pass over `active_rg_list`** doing three things at once:
 
-- copy each unit into `rg_rr_list`;
+- copy each unit's index into `rg_rr_list`;
 - accumulate `sum(dispatch_queue_size)` to compute `F = dispatch_queue_capacity - sum`;
 - record the index `k` of `last_served_rg`.
 
@@ -246,8 +263,8 @@ Set `arm = (k + 1) % rg_rr_list.len()`, or `0` if `last_served_rg` is absent fro
 ```
 loop {
     if F == 0 || rg_rr_list.is_empty() { break }
-    let unit = rg_rr_list[arm];
-    match unit.borrow_mut().try_make_assignment(&mut F, &global_writer) {
+    let unit = &mut rg_units[rg_rr_list[arm]];
+    match unit.try_make_assignment(&mut F, job_registry, &global_writer) {
         Ok((job_id, task_id)) => {
             global_task_set.remove(&(job_id, task_id));
             F -= 1;
@@ -272,14 +289,16 @@ Note the two removals are distinct. Removal from `rg_rr_list` means "nothing mor
 
 #### `try_make_assignment`
 
-A method on `RgSchedulingUnit`, taking `&mut F` and the global dispatch queue writer as parameters. Being a method on the unit rather than on the core keeps the borrows disjoint.
+A method on `RgSchedulingUnit`, taking `&mut F`, `&mut JobRegistry`, and the global dispatch queue writer as parameters. It needs `&mut RgSchedulingUnit` and `&mut` the job arena **at the same time**: it reads and mutates the unit's `active_jobs` and `rr_arm` while resolving the keys they hold into entries it pops tasks from.
+
+That is why it is a method on the unit and not on the core. `self.rg_units[i].try_make_assignment(&mut self.job_registry, …)` reached through a method on the core's `&mut self` is rejected — the method call borrows all of `self`, so the argument cannot borrow a field of it. The caller therefore destructures the core's fields first ([step a](#54-step-4--dispatch-queue-filling)) and passes two disjoint `&mut` bindings, which the borrow checker accepts because they name different fields. This is checked statically: there is no runtime borrow to fail.
 
 1. If `finalize_queue`, `active_jobs`, and `pending_jobs` are all empty, return `Err(NoTask)`.
 2. If the group's own dispatch queue size `S >= F`, return `Err(DispatchQueueFull)`. This is the dynamic threshold with α = 1 ([§6](#6-admission-policy)).
 3. **If `finalize_queue` is non-empty, pop it** and dispatch that finalization task.
 4. Otherwise take a regular task:
-   - If the active job at `rr_arm` is finalized, swap it out for the next non-finalized job in `pending_jobs`.
-   - Call `get_next_task()`. If it yields nothing, decrement that job's `downgrade_counter`; if the counter reaches zero, buffer the job for downgrade and swap in the next pending job, otherwise advance `rr_arm` to the next active job.
+   - Resolve the key of the active job at `rr_arm`. If it does not resolve, the job has been removed — swap it out for the next key in `pending_jobs` that does resolve.
+   - Call `get_next_task()` on the resolved entry. If it yields nothing, decrement that job's `downgrade_counter`; if the counter reaches zero, buffer the job for downgrade and swap in the next pending job, otherwise advance `rr_arm` to the next active job.
 5. Publish the resulting assignment **in this order**:
    - `dispatch_queue_sender.try_send(assignment)` — into the group's own queue first, so a pinned execution manager can take it immediately;
    - then compare `living_hint` `H` against the group's current queue size `S`. If `H >= S`, done. Otherwise increment `H` and send this unit's `RgDispatchQueueReader` to the global dispatch queue.
@@ -296,7 +315,7 @@ Prioritising is preferable there because a finalization task completes a job and
 
 ### 5.5 Promotion, downgrade, and retirement
 
-Promotion pops `pending_jobs` until it finds a job with at least one schedulable task. A job found finalized during this scan is discarded outright — it is no longer in the job registry.
+Promotion pops `pending_jobs` until it finds a job with at least one schedulable task. A key that fails to resolve is discarded outright: the job has been removed from the registry, and the popped key was the last thing referring to it.
 
 Downgrades are buffered and applied once, at the end of step 4:
 
@@ -310,7 +329,9 @@ A resource group may therefore exhaust its active and pending jobs within a tick
 
 ### 5.6 Step 5 — job retirement
 
-Remove every job in `jobs_to_retire` from the job registry. Batching retirement here rather than inside the decision loop keeps the loop free of registry mutation.
+Remove every key in `jobs_to_retire` from the job registry. Batching retirement here rather than inside the decision loop keeps the loop free of registry mutation.
+
+Retirement buffers keys rather than job IDs. A retired job is one that stopped producing tasks, so its `ready_tasks` is empty and there is nothing to drain out of the global task set — but the key still matters: a job that was removed and re-created between the buffering and the removal is a *different* job, and a stale key declines to remove it where a job ID would have removed it by mistake.
 
 ## 6. Admission policy
 
@@ -431,19 +452,27 @@ Four, each of which fails silently:
 
 **Occupancy accounting.** Every resource group holding assignments is in `active_rg_list`, so `F` never over-states free space.
 
-**Job placement.** A job entry is co-owned by the job registry and by exactly one of: an active job list, a pending job queue, or the per-tick downgrade buffer. Violating this turns a `RefCell` borrow into a panic — read flags and drop guards before scanning sibling entries.
+**Job placement.** A job entry is owned by the job registry, and its key is held by exactly one scheduling position: an active job list, a pending job queue, or the per-tick downgrade buffer.
+
+This invariant no longer has a runtime safety net, and no longer needs one. It used to be enforced by `RefCell`, where violating it turned a borrow into a panic; the arena replaces that with two static properties. Two simultaneous mutable borrows of the arena are rejected by the borrow checker, at compile time, so a path that would have panicked does not build. And a key held past its entry's removal fails lookup rather than aliasing a different job, so a duplicated key degrades into a `None` rather than into two positions mutating one entry. What remains is a scheduling-correctness invariant — a job in two positions is dispatched from twice per round — not a liveness one.
+
+No path in the design needs two job entries mutably at once. One that did would use `SlotMap::get_disjoint_mut`, which takes the keys together and returns `None` if they alias; it would not reach for a second borrow of the arena.
 
 ## 9. Session bump
 
 Detected in step 1 from the session ID returned by the inbound-queue gRPC calls, and applied at the end of that step, in this order:
 
 1. **Bump the global session ID.** Assignments already taken from the global dispatch queue now fail their session check and are dropped by the service.
-2. **Clear the resource group registry** — every entry in `rg_table`, and `active_rg_list`.
-3. **Clear the job registry.**
+2. **Clear the resource group registry** — every entry in `rg_table`, and `rg_units`, `rg_index`, and `active_rg_list` **together, in this one operation**.
+3. **Clear the job registry** — both `jobs` and `by_job_id`.
 4. **Clear the global task set and the finalized job table.** Required: storage replays its ready tasks after a bump, and stale dedup entries would cause every replayed task to be dropped with nothing left in the registry to schedule it from.
 5. **Drain the global dispatch queue.**
 
 Per-group queues are not drained explicitly; they are dropped with `rg_table`. An execution manager still blocked on an old reader keeps it alive but its assignments fail the session check.
+
+**Step 2 is a correctness requirement, not tidiness.** Clearing `rg_units` is the one event that invalidates positions in it, and `rg_units` is a plain `Vec` precisely because that event is the only one ([§3.4](#34-resource-group-registry)). Indices carry no generation, so a surviving `active_rg_list` entry or `rg_index` value would resolve against the new session's units — either out of bounds, or, once the new session has re-created a few groups, silently against the wrong group. Both index holders must therefore be cleared in the same operation as the `Vec` they index; the type system does not check this, and it is why the three are named together above rather than left to the reader.
+
+Job keys need no such care. A key held across the bump fails to resolve against the cleared arena, which is the same `None` any stale key produces — the bump is not a special case for them.
 
 ## 10. Configuration
 

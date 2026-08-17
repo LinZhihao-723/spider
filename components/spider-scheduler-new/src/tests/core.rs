@@ -315,11 +315,10 @@ async fn a_rescheduled_assignment_is_readmitted() -> anyhow::Result<()> {
 ///
 /// Panics if the core has no scheduling unit for `rg_id`.
 fn is_active(fixture: &CoreFixture, rg_id: ResourceGroupId) -> bool {
-    fixture
+    let unit_index = *fixture
         .core
-        .rg_units
+        .rg_index
         .get(&rg_id)
-        .expect("the core holds a scheduling unit for the group")
-        .borrow()
-        .is_active
+        .expect("the core holds a scheduling unit for the group");
+    fixture.core.rg_units[unit_index].is_active
 }

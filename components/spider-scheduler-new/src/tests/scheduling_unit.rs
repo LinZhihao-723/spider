@@ -8,14 +8,15 @@ use crate::core::DOWNGRADE_LIVES;
 use crate::core::TaskAssignmentIdIssuer;
 use crate::dispatch_queue::GlobalDispatchQueue;
 use crate::error::MakeAssignmentError;
+use crate::job_registry::JobKey;
 use crate::job_registry::JobRegistry;
-use crate::job_registry::SharedJobEntry;
 use crate::resource_group::ResourceGroupTable;
 use crate::scheduling_unit::RgSchedulingUnit;
 use crate::types::FinalizeKind;
 use crate::types::JobId;
 use crate::types::ResourceGroupId;
 use crate::types::TaskId;
+use crate::types::TaskIndex;
 
 /// The resource group every test in this module schedules for.
 const RG_ID: ResourceGroupId = ResourceGroupId::from(4);
@@ -36,7 +37,7 @@ const FREE_SPACE: usize = 32;
 struct UnitFixture {
     unit: RgSchedulingUnit,
     registry: JobRegistry,
-    jobs_to_retire: Vec<JobId>,
+    jobs_to_retire: Vec<JobKey>,
     global_queue: GlobalDispatchQueue,
     id_issuer: TaskAssignmentIdIssuer,
     rg_table: ResourceGroupTable,
@@ -69,17 +70,17 @@ impl UnitFixture {
     ///
     /// # Returns
     ///
-    /// The registered job's entry.
+    /// The key of the registered job.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     ///
     /// * Forwards [`make_job_entry`]'s return values on failure.
-    fn add_job(&mut self, job_id: JobId, num_tasks: usize) -> anyhow::Result<SharedJobEntry> {
-        let entry = make_job_entry(&mut self.registry, job_id, RG_ID, num_tasks)?;
-        self.unit.place_new_job(entry.clone());
-        Ok(entry)
+    fn add_job(&mut self, job_id: JobId, num_tasks: usize) -> anyhow::Result<JobKey> {
+        let job_key = make_job_entry(&mut self.registry, job_id, num_tasks)?;
+        self.unit.place_new_job(job_key);
+        Ok(job_key)
     }
 
     /// Attempts one assignment against `free` free space, as one turn of the core's decision loop
@@ -95,13 +96,62 @@ impl UnitFixture {
     ///
     /// * Forwards [`RgSchedulingUnit::try_make_assignment`]'s return values on failure.
     fn try_make(&mut self, free: usize) -> Result<(JobId, TaskId), MakeAssignmentError> {
-        self.unit.try_make_assignment(
+        let Self {
+            unit,
+            registry,
+            jobs_to_retire,
+            global_queue,
+            id_issuer,
+            ..
+        } = self;
+        unit.try_make_assignment(
             free,
             DEFAULT_SESSION_ID,
-            &self.id_issuer,
-            &self.global_queue,
-            &mut self.jobs_to_retire,
+            id_issuer,
+            global_queue,
+            registry,
+            jobs_to_retire,
         )
+    }
+
+    /// Appends `task_indices` to the ready tasks of the job `job_key` refers to.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the job has been removed from the registry.
+    fn insert_tasks(&mut self, job_key: JobKey, task_indices: Vec<TaskIndex>) {
+        self.registry
+            .get_mut(job_key)
+            .expect("the job is still registered")
+            .insert_tasks(task_indices);
+    }
+
+    /// # Returns
+    ///
+    /// The number of further chances the job `job_key` refers to has to be refilled.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the job has been removed from the registry.
+    fn downgrade_counter(&mut self, job_key: JobKey) -> u32 {
+        self.registry
+            .get_mut(job_key)
+            .expect("the job is still registered")
+            .downgrade_counter()
+    }
+
+    /// # Returns
+    ///
+    /// Whether the job `job_key` refers to still has a buffered ready task.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the job has been removed from the registry.
+    fn has_ready_task(&mut self, job_key: JobKey) -> bool {
+        self.registry
+            .get_mut(job_key)
+            .expect("the job is still registered")
+            .has_ready_task()
     }
 
     /// Closes the group's dispatch queue, so that the channel rejects the next publication.
@@ -185,20 +235,20 @@ fn an_exhausted_active_job_is_replaced_by_a_pending_one() -> anyhow::Result<()> 
 
     assert_eq!(fixture.unit.active_jobs.len(), 1);
     assert_eq!(fixture.unit.pending_jobs.len(), 0);
-    assert_eq!(job_a.downgrade_counter(), 0);
+    assert_eq!(fixture.downgrade_counter(job_a), 0);
     assert_eq!(fixture.jobs_to_retire.as_slice(), &[]);
     Ok(())
 }
 
 #[test]
-fn promotion_discards_a_finalized_pending_job() -> anyhow::Result<()> {
+fn promotion_discards_a_removed_pending_job() -> anyhow::Result<()> {
     let mut fixture = UnitFixture::new(1);
     fixture.add_job(JOB_A, 1)?;
     fixture.add_job(JOB_B, 1)?;
     fixture.add_job(JOB_C, 1)?;
     fixture
         .registry
-        .finalize_and_remove(JOB_B)
+        .remove_by_job_id(JOB_B)
         .expect("the registered job is removed by its finalization");
 
     assert_eq!(fixture.try_make(FREE_SPACE), Ok((JOB_A, TaskId::Index(0))));
@@ -209,13 +259,13 @@ fn promotion_discards_a_finalized_pending_job() -> anyhow::Result<()> {
 }
 
 #[test]
-fn a_finalized_active_job_is_swapped_out_for_a_pending_one() -> anyhow::Result<()> {
+fn a_removed_active_job_is_swapped_out_for_a_pending_one() -> anyhow::Result<()> {
     let mut fixture = UnitFixture::new(1);
     fixture.add_job(JOB_A, 1)?;
     fixture.add_job(JOB_B, 1)?;
     fixture
         .registry
-        .finalize_and_remove(JOB_A)
+        .remove_by_job_id(JOB_A)
         .expect("the registered job is removed by its finalization");
 
     assert_eq!(fixture.try_make(FREE_SPACE), Ok((JOB_B, TaskId::Index(0))));
@@ -228,32 +278,34 @@ fn a_finalized_active_job_is_swapped_out_for_a_pending_one() -> anyhow::Result<(
 fn a_job_that_stops_producing_tasks_is_downgraded_and_then_retired() -> anyhow::Result<()> {
     let mut fixture = UnitFixture::new(1);
     let job_a = fixture.add_job(JOB_A, 1)?;
-    assert_eq!(job_a.downgrade_counter(), DOWNGRADE_LIVES);
+    assert_eq!(fixture.downgrade_counter(job_a), DOWNGRADE_LIVES);
 
     assert_eq!(fixture.try_make(FREE_SPACE), Ok((JOB_A, TaskId::Index(0))));
     assert_eq!(
         fixture.try_make(FREE_SPACE),
         Err(MakeAssignmentError::NoTask)
     );
-    assert_eq!(job_a.downgrade_counter(), 0);
+    assert_eq!(fixture.downgrade_counter(job_a), 0);
     assert_eq!(fixture.unit.active_jobs.len(), 0);
     assert_eq!(fixture.jobs_to_retire.as_slice(), &[]);
 
-    fixture.unit.apply_downgrades();
+    fixture.unit.apply_downgrades(&mut fixture.registry);
     assert_eq!(fixture.unit.pending_jobs.len(), 1);
-    assert_eq!(job_a.downgrade_counter(), DOWNGRADE_LIVES);
+    assert_eq!(fixture.downgrade_counter(job_a), DOWNGRADE_LIVES);
 
     let mut jobs_to_retire = Vec::new();
-    fixture.unit.promote_pending_jobs(&mut jobs_to_retire);
+    fixture
+        .unit
+        .promote_pending_jobs(&mut fixture.registry, &mut jobs_to_retire);
     assert_eq!(jobs_to_retire.as_slice(), &[]);
     assert_eq!(fixture.unit.active_jobs.len(), 0);
-    assert_eq!(job_a.downgrade_counter(), 0);
+    assert_eq!(fixture.downgrade_counter(job_a), 0);
 
     assert_eq!(
         fixture.try_make(FREE_SPACE),
         Err(MakeAssignmentError::NoTask)
     );
-    assert_eq!(fixture.jobs_to_retire.as_slice(), &[JOB_A]);
+    assert_eq!(fixture.jobs_to_retire.as_slice(), &[job_a]);
     assert_eq!(fixture.unit.pending_jobs.len(), 0);
     assert!(!fixture.unit.has_schedulable_task());
     Ok(())
@@ -269,16 +321,18 @@ fn an_arriving_task_restores_a_downgraded_job() -> anyhow::Result<()> {
         fixture.try_make(FREE_SPACE),
         Err(MakeAssignmentError::NoTask)
     );
-    fixture.unit.apply_downgrades();
+    fixture.unit.apply_downgrades(&mut fixture.registry);
 
-    job_a.insert_tasks(vec![1]);
+    fixture.insert_tasks(job_a, vec![1]);
     let mut jobs_to_retire = Vec::new();
-    fixture.unit.promote_pending_jobs(&mut jobs_to_retire);
+    fixture
+        .unit
+        .promote_pending_jobs(&mut fixture.registry, &mut jobs_to_retire);
     assert_eq!(jobs_to_retire.as_slice(), &[]);
     assert_eq!(fixture.unit.active_jobs.len(), 1);
 
     assert_eq!(fixture.try_make(FREE_SPACE), Ok((JOB_A, TaskId::Index(1))));
-    assert_eq!(job_a.downgrade_counter(), DOWNGRADE_LIVES);
+    assert_eq!(fixture.downgrade_counter(job_a), DOWNGRADE_LIVES);
     Ok(())
 }
 
@@ -313,12 +367,12 @@ fn a_rejected_publication_returns_the_regular_task_it_took() -> anyhow::Result<(
         fixture.try_make(FREE_SPACE),
         Err(MakeAssignmentError::DispatchQueueClosed)
     );
-    assert!(job_a.has_ready_task());
+    assert!(fixture.has_ready_task(job_a));
 
     assert_eq!(
         fixture.try_make(FREE_SPACE),
         Err(MakeAssignmentError::DispatchQueueClosed)
     );
-    assert!(job_a.has_ready_task());
+    assert!(fixture.has_ready_task(job_a));
     Ok(())
 }

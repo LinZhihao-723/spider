@@ -22,6 +22,7 @@ use crate::error::CoreError;
 use crate::error::HarnessError;
 use crate::resource_group::ResourceGroupTable;
 use crate::session::SessionManager;
+use crate::storage_client::SchedulerStorageClient;
 use crate::types::TaskAssignment;
 
 pub mod fake_storage;
@@ -46,6 +47,28 @@ pub use crate::harness::metrics::LatencySamples;
 pub use crate::harness::metrics::WorkerKind;
 pub use crate::harness::metrics::WorkerPoolReport;
 pub use crate::harness::metrics::WorkerSamples;
+
+/// Statically asserts that a core and the future its loop produces are both `Send`, so that any
+/// runtime can spawn the core and no later change can silently make it thread-bound again.
+///
+/// The assertion lives here rather than beside [`Core`] because it has to name a concrete storage
+/// client, and [`FakeStorage`] is the only one the crate has; the core must not depend on its own
+/// harness to state a property of itself.
+const _: () = {
+    const fn assert_send<SendType: Send>() {}
+
+    const fn assert_returns_send_future<
+        StorageClientType: SchedulerStorageClient,
+        FutureType: Send,
+        RunType: FnOnce(Core<StorageClientType>) -> FutureType + Copy,
+    >(
+        _run: RunType,
+    ) {
+    }
+
+    assert_send::<Core<FakeStorage>>();
+    assert_returns_send_future(Core::<FakeStorage>::run);
+};
 
 /// How often a run re-checks whether the workload has drained.
 const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(5);
@@ -103,23 +126,15 @@ impl Harness {
         let (_, reschedule_queue_reader) = unbounded_channel::<TaskAssignment>();
         let core_cancellation_token = CancellationToken::new();
 
-        let core_config = config.core;
-        let core_storage = storage.clone();
-        let core_rg_table = rg_table.clone();
-        let core_global_queue = global_queue.clone();
-        let core_session_manager = session_manager.clone();
-        let core_token = core_cancellation_token.clone();
-        let core_thread = run_core_on_dedicated_thread(move || {
-            Core::new(
-                core_config,
-                core_storage,
-                core_rg_table,
-                core_global_queue,
-                core_session_manager,
-                reschedule_queue_reader,
-                core_token,
-            )
-        });
+        let core_thread = run_core_on_dedicated_thread(Core::new(
+            config.core,
+            storage.clone(),
+            rg_table.clone(),
+            global_queue.clone(),
+            session_manager.clone(),
+            reschedule_queue_reader,
+            core_cancellation_token.clone(),
+        ));
 
         let dispatch_service = DispatchService::new(rg_table, global_queue, session_manager);
         let server = match HarnessServer::start(dispatch_service, storage.clone()).await {

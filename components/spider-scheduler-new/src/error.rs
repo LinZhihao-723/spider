@@ -40,14 +40,6 @@ pub enum MakeAssignmentError {
     DispatchQueueClosed,
 }
 
-/// Errors returned by [`crate::job_registry::SharedJobEntry`] operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum JobEntryError {
-    /// The job is finalized, so no further regular task may be scheduled from it.
-    #[error("job is finalized")]
-    Finalized,
-}
-
 /// Errors returned by the prototype's test harness.
 #[derive(Debug, thiserror::Error)]
 pub enum HarnessError {

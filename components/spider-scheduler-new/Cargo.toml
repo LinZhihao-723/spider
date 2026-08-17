@@ -23,6 +23,7 @@ dashmap = { workspace = true }
 prost = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+slotmap = { workspace = true }
 spider-core = { workspace = true }
 thiserror = { workspace = true }
 tokio = {

@@ -8,10 +8,8 @@
 /// Drives ticks on `core` until `predicate` holds, failing the calling test if it does not hold
 /// within [`TICK_DEADLINE`].
 ///
-/// A macro rather than an async function: the core's future is `!Send` by construction, and an
-/// `async fn` awaiting it can only satisfy `clippy::future_not_send` by silencing the lint. The
-/// predicate is an expression rather than a closure so that it may borrow whatever the tick
-/// mutates.
+/// A macro rather than an async function so that the predicate is an expression rather than a
+/// closure, and may therefore borrow whatever the tick mutates.
 macro_rules! tick_until {
     ($core:expr, $predicate:expr) => {{
         let deadline = tokio::time::Instant::now() + $crate::tests::TICK_DEADLINE;
@@ -38,10 +36,8 @@ mod job_registry;
 mod metrics;
 mod scheduling_unit;
 
-use std::cell::RefCell;
 use std::num::NonZeroU64;
 use std::num::NonZeroUsize;
-use std::rc::Rc;
 use std::time::Duration;
 
 use anyhow::bail;
@@ -54,8 +50,8 @@ use crate::core::Core;
 use crate::dispatch_queue::GlobalDispatchQueue;
 use crate::harness::FakeStorage;
 use crate::harness::FakeStorageConfig;
+use crate::job_registry::JobKey;
 use crate::job_registry::JobRegistry;
-use crate::job_registry::SharedJobEntry;
 use crate::job_registry::UpsertOutcome;
 use crate::resource_group::ResourceGroupTable;
 use crate::resource_group::RgDispatchQueueReader;
@@ -121,27 +117,29 @@ impl CoreFixture {
         }
     }
 
-    /// Puts `rg_id` on the core's active resource group list, creating its scheduling unit against
-    /// the group's dispatch queue endpoints if the core has none.
+    /// Puts `rg_id` on the core's active resource group list, appending its scheduling unit built
+    /// against the group's dispatch queue endpoints if the core has none.
     ///
     /// # Returns
     ///
-    /// The group's scheduling unit.
-    fn activate_group(&mut self, rg_id: ResourceGroupId) -> Rc<RefCell<RgSchedulingUnit>> {
-        if let Some(unit) = self.core.rg_units.get(&rg_id) {
-            return Rc::clone(unit);
+    /// The position of the group's scheduling unit in the core's unit arena.
+    fn activate_group(&mut self, rg_id: ResourceGroupId) -> usize {
+        if let Some(unit_index) = self.core.rg_index.get(&rg_id) {
+            return *unit_index;
         }
 
-        let unit = Rc::new(RefCell::new(make_unit(
+        let mut unit = make_unit(
             &self.rg_table,
             rg_id,
             self.session_manager.current(),
             self.active_job_list_capacity,
-        )));
-        unit.borrow_mut().is_active = true;
-        self.core.rg_units.insert(rg_id, Rc::clone(&unit));
-        self.core.active_rg_list.push(Rc::clone(&unit));
-        unit
+        );
+        unit.is_active = true;
+        let unit_index = self.core.rg_units.len();
+        self.core.rg_units.push(unit);
+        self.core.rg_index.insert(rg_id, unit_index);
+        self.core.active_rg_list.push(unit_index);
+        unit_index
     }
 
     /// Registers a job of `num_tasks` buffered ready tasks against `rg_id`, exactly as a completed
@@ -163,8 +161,9 @@ impl CoreFixture {
                 .global_task_set
                 .insert((job_id, TaskId::Index(task_index)));
         }
-        let entry = make_job_entry(&mut self.core.job_registry, job_id, rg_id, num_tasks)?;
-        self.activate_group(rg_id).borrow_mut().place_new_job(entry);
+        let job_key = make_job_entry(&mut self.core.job_registry, job_id, num_tasks)?;
+        let unit_index = self.activate_group(rg_id);
+        self.core.rg_units[unit_index].place_new_job(job_key);
         Ok(())
     }
 
@@ -272,7 +271,7 @@ fn make_unit(
 ///
 /// # Returns
 ///
-/// The registered job's entry, which still needs a scheduling position.
+/// The key of the registered job, which still needs a scheduling position.
 ///
 /// # Errors
 ///
@@ -282,14 +281,13 @@ fn make_unit(
 fn make_job_entry(
     registry: &mut JobRegistry,
     job_id: JobId,
-    rg_id: ResourceGroupId,
     num_tasks: usize,
-) -> anyhow::Result<SharedJobEntry> {
+) -> anyhow::Result<JobKey> {
     let task_indices: Vec<TaskIndex> = (0..num_tasks).collect();
-    let UpsertOutcome::New(entry) = registry.upsert(job_id, rg_id, task_indices) else {
+    let UpsertOutcome::New(job_key) = registry.upsert(job_id, task_indices) else {
         bail!("job {job_id} is already registered");
     };
-    Ok(entry)
+    Ok(job_key)
 }
 
 /// # Returns

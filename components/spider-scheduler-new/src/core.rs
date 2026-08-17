@@ -2,17 +2,15 @@
 //!
 //! Each tick collects the inbound queue's polling results, folds them into the core's job registry
 //! and resource group scheduling units, refills the dispatch buffer under the admission policy, and
-//! retires the jobs that ran dry. The loop holds `Rc`-shared scheduling state across await points
-//! and is therefore `!Send`: it runs on a dedicated thread under a `LocalSet`, while the inbound
-//! polls it issues are ordinary `Send` background tasks.
+//! retires the jobs that ran dry. The core owns all of that state outright -- job entries in a
+//! generational arena, resource group scheduling units in an append-only `Vec` -- so nothing it
+//! holds across an await point is thread-bound and the loop's future is `Send`.
 //!
 //! Every tick is timed step by step into a [`TickSample`]. Being single-threaded, the core owns the
 //! resulting log outright and hands it back when the loop stops.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -30,8 +28,8 @@ use crate::dispatch_queue::GlobalDispatchQueue;
 use crate::error::CoreError;
 use crate::error::MakeAssignmentError;
 use crate::error::StorageClientError;
+use crate::job_registry::JobKey;
 use crate::job_registry::JobRegistry;
-use crate::job_registry::SharedJobEntry;
 use crate::job_registry::UpsertOutcome;
 use crate::resource_group::ResourceGroupTable;
 use crate::scheduling_unit::RgSchedulingUnit;
@@ -82,8 +80,15 @@ pub struct Core<StorageClientType: SchedulerStorageClient> {
     pub(crate) global_task_set: HashSet<(JobId, TaskId)>,
     pub(crate) finalized_jobs: HashSet<JobId>,
     pub(crate) job_registry: JobRegistry,
-    pub(crate) rg_units: HashMap<ResourceGroupId, Rc<RefCell<RgSchedulingUnit>>>,
-    pub(crate) active_rg_list: Vec<Rc<RefCell<RgSchedulingUnit>>>,
+
+    /// The scheduling units of every resource group the core has seen this session.
+    ///
+    /// Append-only within a session: a group is never removed individually, so a position in this
+    /// vector is stable until [`Self::apply_session_bump`] flushes the whole of it.
+    pub(crate) rg_units: Vec<RgSchedulingUnit>,
+
+    pub(crate) rg_index: HashMap<ResourceGroupId, usize>,
+    pub(crate) active_rg_list: Vec<usize>,
     pub(crate) last_served_rg: Option<ResourceGroupId>,
 
     config: CoreConfig,
@@ -117,7 +122,8 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
             global_task_set: HashSet::new(),
             finalized_jobs: HashSet::new(),
             job_registry: JobRegistry::new(),
-            rg_units: HashMap::new(),
+            rg_units: Vec::new(),
+            rg_index: HashMap::new(),
             active_rg_list: Vec::new(),
             last_served_rg: None,
             config,
@@ -169,9 +175,6 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
     /// Returns an error if:
     ///
     /// * Forwards [`Self::tick`]'s return values on failure.
-    // The core co-owns its scheduling state through `Rc`, so its future is `!Send` by
-    // construction. It runs on a dedicated thread under a `LocalSet`, never on a shared executor.
-    #[allow(clippy::future_not_send)]
     pub async fn run(mut self) -> Result<Vec<TickSample>, CoreError> {
         tracing::info!(
             config = ? self.config,
@@ -227,9 +230,6 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
     ///
     /// * Forwards [`AsyncInboundQueueReader::try_collect_result`]'s return values on failure.
     /// * Forwards [`Self::start_inbound_poll`]'s return values on failure.
-    // `!Send` for the same reason as [`Self::run`]: the core co-owns `Rc` scheduling state across
-    // the await points below, and runs under a `LocalSet` rather than a shared executor.
-    #[allow(clippy::future_not_send)]
     pub(crate) async fn tick(&mut self) -> Result<(), CoreError> {
         let mut timer = TickTimer::start();
         let poll_state = self
@@ -285,6 +285,12 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
     /// Clearing the dedup set is load-bearing rather than tidy: storage replays its ready tasks
     /// after a bump, and a stale dedup entry would drop a replayed task while the registry no
     /// longer holds anything to schedule it from.
+    ///
+    /// [`Self::rg_units`], [`Self::rg_index`], and [`Self::active_rg_list`] must be cleared as one
+    /// operation, and this is the only place any of them is cleared. Positions in `rg_units` carry
+    /// no generation, so an index that outlives the flush does not fail: it resolves against the
+    /// new session's units, either out of bounds or -- once the new session has re-created a few
+    /// groups -- silently against the wrong group. Nothing in the type system checks this.
     fn apply_session_bump(&mut self, new_session_id: SessionId) {
         tracing::info!(
             new_session_id,
@@ -297,6 +303,7 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
         self.session_manager.bump(new_session_id);
         self.rg_table.clear();
         self.rg_units.clear();
+        self.rg_index.clear();
         self.active_rg_list.clear();
         self.last_served_rg = None;
         self.job_registry.clear();
@@ -364,7 +371,7 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
                 }
                 // The job's still-buffered regular tasks will never be published, so they must
                 // leave the dedup set with it or nothing would ever remove them.
-                if let Some(job_entry) = self.job_registry.finalize_and_remove(entry.job_id) {
+                if let Some(mut job_entry) = self.job_registry.remove_by_job_id(entry.job_id) {
                     for task_index in job_entry.take_ready_tasks() {
                         self.global_task_set
                             .remove(&(entry.job_id, TaskId::Index(task_index)));
@@ -401,13 +408,8 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
             if task_indices.is_empty() {
                 continue;
             }
-            if let UpsertOutcome::New(entry) = self.job_registry.upsert(job_id, rg_id, task_indices)
-            {
-                rg_updates
-                    .entry(entry.rg_id())
-                    .or_default()
-                    .new_jobs
-                    .push(entry);
+            if let UpsertOutcome::New(job_key) = self.job_registry.upsert(job_id, task_indices) {
+                rg_updates.entry(rg_id).or_default().new_jobs.push(job_key);
             }
         }
 
@@ -418,44 +420,42 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
     /// group the updates touch.
     fn apply_rg_updates(&mut self, rg_updates: HashMap<ResourceGroupId, RgUpdate>) {
         for (rg_id, update) in rg_updates {
-            let unit = self.get_or_create_unit(rg_id);
-            let activated = {
-                let mut unit_ref = unit.borrow_mut();
-                for (job_id, kind) in update.finalized {
-                    unit_ref.push_finalization(job_id, kind);
-                }
-                for entry in update.new_jobs {
-                    unit_ref.place_new_job(entry);
-                }
-                let activated = !unit_ref.is_active;
-                unit_ref.is_active = true;
-                activated
-            };
+            let unit_index = self.get_or_create_unit(rg_id);
+            let unit = &mut self.rg_units[unit_index];
+            for (job_id, kind) in update.finalized {
+                unit.push_finalization(job_id, kind);
+            }
+            for job_key in update.new_jobs {
+                unit.place_new_job(job_key);
+            }
+            let activated = !unit.is_active;
+            unit.is_active = true;
             if activated {
-                self.active_rg_list.push(unit);
+                self.active_rg_list.push(unit_index);
             }
         }
     }
 
     /// # Returns
     ///
-    /// The scheduling unit of `rg_id`, created against the group's dispatch queue endpoints if the
-    /// core has none.
-    fn get_or_create_unit(&mut self, rg_id: ResourceGroupId) -> Rc<RefCell<RgSchedulingUnit>> {
-        if let Some(unit) = self.rg_units.get(&rg_id) {
-            return Rc::clone(unit);
+    /// The position of `rg_id`'s scheduling unit in [`Self::rg_units`], appending a unit built
+    /// against the group's dispatch queue endpoints if the core has none.
+    fn get_or_create_unit(&mut self, rg_id: ResourceGroupId) -> usize {
+        if let Some(unit_index) = self.rg_index.get(&rg_id) {
+            return *unit_index;
         }
 
         let endpoints = self
             .rg_table
             .get_or_create(rg_id, self.session_manager.current());
-        let unit = Rc::new(RefCell::new(RgSchedulingUnit::new(
+        let unit_index = self.rg_units.len();
+        self.rg_units.push(RgSchedulingUnit::new(
             rg_id,
             endpoints,
             self.config.active_job_list_capacity.get(),
-        )));
-        self.rg_units.insert(rg_id, Rc::clone(&unit));
-        unit
+        ));
+        self.rg_index.insert(rg_id, unit_index);
+        unit_index
     }
 
     /// Publishes assignments into the per-resource-group dispatch queues under the admission
@@ -467,30 +467,42 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
     ///
     /// * The jobs that exhausted their downgrade budget and must be retired.
     /// * The number of assignments published.
-    fn fill_dispatch_queues(&mut self) -> (Vec<JobId>, u64) {
+    fn fill_dispatch_queues(&mut self) -> (Vec<JobKey>, u64) {
         let mut jobs_to_retire = Vec::new();
         let mut assignments_published = 0;
         if self.active_rg_list.is_empty() {
             return (jobs_to_retire, assignments_published);
         }
 
-        let mut rg_rr_list = Vec::with_capacity(self.active_rg_list.len());
+        // The decision loop needs the scheduling units and the job arena borrowed mutably at the
+        // same time, which the borrow checker accepts only for bindings that name distinct fields.
+        let Self {
+            global_task_set,
+            job_registry,
+            rg_units,
+            active_rg_list,
+            last_served_rg,
+            config,
+            global_queue,
+            session_manager,
+            id_issuer,
+            ..
+        } = self;
+
+        let mut rg_rr_list = Vec::with_capacity(active_rg_list.len());
         let mut occupancy = 0;
         let mut last_served_index = None;
-        for (index, unit) in self.active_rg_list.iter().enumerate() {
-            {
-                let unit_ref = unit.borrow();
-                occupancy += unit_ref.dispatch_queue_size();
-                if Some(unit_ref.rg_id) == self.last_served_rg {
-                    last_served_index = Some(index);
-                }
+        for (index, unit_index) in active_rg_list.iter().enumerate() {
+            let unit = &rg_units[*unit_index];
+            occupancy += unit.dispatch_queue_size();
+            if Some(unit.rg_id) == *last_served_rg {
+                last_served_index = Some(index);
             }
-            rg_rr_list.push(Rc::clone(unit));
+            rg_rr_list.push(*unit_index);
         }
         // Bounding by the free space measured here is what makes the loop terminate: the queues
         // drain concurrently, so the true free space only ever grows.
-        let mut free = self
-            .config
+        let mut free = config
             .dispatch_queue_capacity
             .get()
             .saturating_sub(occupancy);
@@ -498,32 +510,34 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
         // first, which matters because `free` shrinks as the tick proceeds.
         let mut arm = last_served_index.map_or(0, |index| (index + 1) % rg_rr_list.len());
 
-        for unit in &rg_rr_list {
-            unit.borrow_mut().promote_pending_jobs(&mut jobs_to_retire);
+        for unit_index in &rg_rr_list {
+            rg_units[*unit_index].promote_pending_jobs(job_registry, &mut jobs_to_retire);
         }
 
-        let session_id = self.session_manager.current();
+        let session_id = session_manager.current();
         let mut exhausted_units = Vec::new();
         while 0 != free && !rg_rr_list.is_empty() {
-            let unit = Rc::clone(&rg_rr_list[arm]);
-            let result = unit.borrow_mut().try_make_assignment(
+            let unit_index = rg_rr_list[arm];
+            let unit = &mut rg_units[unit_index];
+            let result = unit.try_make_assignment(
                 free,
                 session_id,
-                &self.id_issuer,
-                &self.global_queue,
+                id_issuer,
+                global_queue,
+                job_registry,
                 &mut jobs_to_retire,
             );
             match result {
                 Ok((job_id, task_id)) => {
-                    self.global_task_set.remove(&(job_id, task_id));
+                    global_task_set.remove(&(job_id, task_id));
                     free -= 1;
                     assignments_published += 1;
-                    self.last_served_rg = Some(unit.borrow().rg_id);
+                    *last_served_rg = Some(unit.rg_id);
                     arm = (arm + 1) % rg_rr_list.len();
                 }
                 Err(err) => {
                     if MakeAssignmentError::NoTask == err {
-                        exhausted_units.push(unit);
+                        exhausted_units.push(unit_index);
                     }
                     rg_rr_list.swap_remove(arm);
                     // `swap_remove` moved the tail element into this slot, so advancing the arm
@@ -535,8 +549,8 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
             }
         }
 
-        for unit in &self.active_rg_list {
-            unit.borrow_mut().apply_downgrades();
+        for unit_index in active_rg_list.iter() {
+            rg_units[*unit_index].apply_downgrades(job_registry);
         }
         self.deactivate_exhausted_units(exhausted_units);
 
@@ -549,29 +563,27 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
     /// The empty-queue condition is required for correctness: free space is summed over the active
     /// list alone, so a deactivated group still holding assignments would hide its occupancy and
     /// let the core over-admit.
-    fn deactivate_exhausted_units(&mut self, exhausted_units: Vec<Rc<RefCell<RgSchedulingUnit>>>) {
-        for unit in exhausted_units {
-            {
-                let mut unit_ref = unit.borrow_mut();
-                if unit_ref.has_schedulable_task() || 0 != unit_ref.dispatch_queue_size() {
-                    continue;
-                }
-                unit_ref.is_active = false;
+    fn deactivate_exhausted_units(&mut self, exhausted_units: Vec<usize>) {
+        for unit_index in exhausted_units {
+            let unit = &mut self.rg_units[unit_index];
+            if unit.has_schedulable_task() || 0 != unit.dispatch_queue_size() {
+                continue;
             }
-            if let Some(index) = self
+            unit.is_active = false;
+            if let Some(position) = self
                 .active_rg_list
                 .iter()
-                .position(|active_unit| Rc::ptr_eq(active_unit, &unit))
+                .position(|active_index| *active_index == unit_index)
             {
-                self.active_rg_list.swap_remove(index);
+                self.active_rg_list.swap_remove(position);
             }
         }
     }
 
-    /// Drops the core's co-ownership of every job that ran out of downgrade lives.
-    fn retire_jobs(&mut self, jobs_to_retire: Vec<JobId>) {
-        for job_id in jobs_to_retire {
-            self.job_registry.remove(job_id);
+    /// Drops the registry's entry for every job that ran out of downgrade lives.
+    fn retire_jobs(&mut self, jobs_to_retire: Vec<JobKey>) {
+        for job_key in jobs_to_retire {
+            self.job_registry.remove(job_key);
         }
     }
 
@@ -618,8 +630,8 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
     fn count_buffered_finalizations(&self) -> (usize, usize) {
         let mut num_commit_ready = 0;
         let mut num_cleanup_ready = 0;
-        for unit in self.rg_units.values() {
-            let (num_commits, num_cleanups) = unit.borrow().num_buffered_finalizations();
+        for unit in &self.rg_units {
+            let (num_commits, num_cleanups) = unit.num_buffered_finalizations();
             num_commit_ready += num_commits;
             num_cleanup_ready += num_cleanups;
         }
@@ -627,57 +639,47 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
     }
 }
 
-/// Runs the core built by `core_factory` on a dedicated OS thread, under a current-thread runtime
-/// and a `LocalSet`, discarding the core's tick samples.
+/// Runs `core` on a dedicated OS thread under a current-thread runtime, discarding its tick
+/// samples.
 ///
-/// The core is built on the spawned thread rather than handed to it: it co-owns its scheduling
-/// state through `Rc` and is therefore `!Send`.
+/// The thread is a measurement choice rather than a requirement: it keeps the loop's cadence and
+/// per-step timings clear of whatever else shares the caller's runtime. A caller that does not care
+/// about either may equally spawn [`Core::run`] as an ordinary task.
 ///
 /// # Type Parameters
 ///
 /// * `StorageClientType` - The storage client the core polls the inbound queue through.
-/// * `CoreFactoryType` - The factory that builds the core on the spawned thread.
 ///
 /// # Returns
 ///
 /// The join handle of the spawned thread, resolving to the core's exit status.
-pub fn run_core_on_dedicated_thread<
-    StorageClientType: SchedulerStorageClient,
-    CoreFactoryType: FnOnce() -> Core<StorageClientType> + Send + 'static,
->(
-    core_factory: CoreFactoryType,
+pub fn run_core_on_dedicated_thread<StorageClientType: SchedulerStorageClient>(
+    core: Core<StorageClientType>,
 ) -> std::thread::JoinHandle<Result<(), CoreError>> {
-    std::thread::spawn(move || run_core_locally(core_factory).map(|_| ()))
+    std::thread::spawn(move || run_core_to_completion(core).map(|_| ()))
 }
 
-/// Runs the core built by `core_factory` exactly as [`run_core_on_dedicated_thread`] does, keeping
-/// its tick samples.
+/// Runs `core` exactly as [`run_core_on_dedicated_thread`] does, keeping its tick samples.
 ///
 /// # Type Parameters
 ///
 /// * `StorageClientType` - The storage client the core polls the inbound queue through.
-/// * `CoreFactoryType` - The factory that builds the core on the spawned thread.
 ///
 /// # Returns
 ///
 /// The join handle of the spawned thread, resolving to the core's tick samples or to its exit
 /// status on failure.
-pub fn run_core_on_dedicated_thread_with_tick_samples<
-    StorageClientType: SchedulerStorageClient,
-    CoreFactoryType: FnOnce() -> Core<StorageClientType> + Send + 'static,
->(
-    core_factory: CoreFactoryType,
+pub fn run_core_on_dedicated_thread_with_tick_samples<StorageClientType: SchedulerStorageClient>(
+    core: Core<StorageClientType>,
 ) -> std::thread::JoinHandle<Result<Vec<TickSample>, CoreError>> {
-    std::thread::spawn(move || run_core_locally(core_factory))
+    std::thread::spawn(move || run_core_to_completion(core))
 }
 
-/// Builds a core with `core_factory` on the calling thread and runs it to completion under a
-/// current-thread runtime and a `LocalSet`.
+/// Runs `core` to completion on the calling thread under a current-thread runtime of its own.
 ///
 /// # Type Parameters
 ///
 /// * `StorageClientType` - The storage client the core polls the inbound queue through.
-/// * `CoreFactoryType` - The factory that builds the core.
 ///
 /// # Returns
 ///
@@ -689,19 +691,15 @@ pub fn run_core_on_dedicated_thread_with_tick_samples<
 ///
 /// * [`CoreError::Internal`] if the runtime could not be built.
 /// * Forwards [`Core::run`]'s return values on failure.
-fn run_core_locally<
-    StorageClientType: SchedulerStorageClient,
-    CoreFactoryType: FnOnce() -> Core<StorageClientType>,
->(
-    core_factory: CoreFactoryType,
+fn run_core_to_completion<StorageClientType: SchedulerStorageClient>(
+    core: Core<StorageClientType>,
 ) -> Result<Vec<TickSample>, CoreError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| CoreError::Internal(e.to_string()))?;
-    let local_set = tokio::task::LocalSet::new();
 
-    local_set.block_on(&runtime, core_factory().run())
+    runtime.block_on(core.run())
 }
 
 /// The number of chances a job that produced no task gets before it is retired.
@@ -711,7 +709,7 @@ pub(crate) const DOWNGRADE_LIVES: u32 = 1;
 #[derive(Default)]
 struct RgUpdate {
     finalized: Vec<(JobId, FinalizeKind)>,
-    new_jobs: Vec<SharedJobEntry>,
+    new_jobs: Vec<JobKey>,
 }
 
 /// The state of an asynchronous inbound-queue poll.
