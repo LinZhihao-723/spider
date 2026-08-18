@@ -154,7 +154,7 @@ impl RgSchedulingUnit {
     /// * [`MakeAssignmentError::NoTask`] if the group has nothing left to schedule.
     /// * [`MakeAssignmentError::DispatchQueueFull`] if the group's queue occupancy has reached the
     ///   admission threshold.
-    /// * [`MakeAssignmentError::DispatchQueueClosed`] if the group's dispatch queue is closed.
+    /// * Forwards [`Self::publish`]'s return values on failure.
     pub fn try_make_assignment(
         &mut self,
         free: usize,
@@ -171,30 +171,22 @@ impl RgSchedulingUnit {
             return Err(MakeAssignmentError::DispatchQueueFull);
         }
 
-        let (taken, job_id, task_id) = if let Some((job_id, kind)) = self.pop_finalization() {
-            (
-                TakenTask::Finalization(job_id, kind),
-                job_id,
-                TaskId::from(kind),
-            )
-        } else {
-            let (job_key, job_id, task_index) = self
-                .take_regular_task(job_registry, jobs_to_retire)
-                .ok_or(MakeAssignmentError::NoTask)?;
-            (
-                TakenTask::Regular(job_key, task_index),
-                job_id,
-                TaskId::Index(task_index),
-            )
-        };
-
-        // The task is already out of the structure that held it, so a rejected publication has to
-        // put it back: the core removes it from the dedup set only on success, and an entry that is
-        // in neither place can never be re-admitted.
-        if let Err(e) = self.publish(job_id, task_id, session_id, id_issuer, global_queue) {
-            self.restore(&taken, job_registry);
-            return Err(e);
+        // The task is only taken out of the structure that buffered it once its publication has
+        // succeeded: the core removes it from the dedup set only on success, so a task dropped by a
+        // rejected publication would be in neither place and could never be re-admitted.
+        if let Some((job_id, kind)) = self.peek_finalization() {
+            let task_id = TaskId::from(kind);
+            self.publish(job_id, task_id, session_id, id_issuer, global_queue)?;
+            self.commit_finalization();
+            return Ok((job_id, task_id));
         }
+
+        let (job_key, job_id, task_index) = self
+            .peek_regular_task(job_registry, jobs_to_retire)
+            .ok_or(MakeAssignmentError::NoTask)?;
+        let task_id = TaskId::Index(task_index);
+        self.publish(job_id, task_id, session_id, id_issuer, global_queue)?;
+        Self::commit_regular_task(job_key, job_registry);
         Ok((job_id, task_id))
     }
 
@@ -209,29 +201,21 @@ impl RgSchedulingUnit {
         }
     }
 
-    /// Takes the group's next owed finalization.
+    /// Reads the group's next owed finalization without taking it.
     ///
     /// # Returns
     ///
     /// The job to finalize and how, or [`None`] if the group owes no finalization.
-    fn pop_finalization(&mut self) -> Option<(JobId, FinalizeKind)> {
-        let (job_id, kind) = self.finalize_queue.pop_front()?;
-        self.discount_finalization(kind);
-        Some((job_id, kind))
+    fn peek_finalization(&self) -> Option<(JobId, FinalizeKind)> {
+        self.finalize_queue.front().copied()
     }
 
-    /// Returns a task whose publication was rejected to the structure it was taken from.
-    fn restore(&mut self, taken: &TakenTask, job_registry: &mut JobRegistry) {
-        match *taken {
-            TakenTask::Finalization(job_id, kind) => {
-                self.finalize_queue.push_front((job_id, kind));
-                self.count_finalization(kind);
-            }
-            TakenTask::Regular(job_key, task_index) => {
-                if let Some(entry) = job_registry.get_mut(job_key) {
-                    entry.restore_task(task_index);
-                }
-            }
+    /// Takes the finalization read by [`Self::peek_finalization`] off the group's finalize queue.
+    ///
+    /// The call is a no-op if the group owes no finalization.
+    fn commit_finalization(&mut self) {
+        if let Some((_, kind)) = self.finalize_queue.pop_front() {
+            self.discount_finalization(kind);
         }
     }
 
@@ -255,19 +239,20 @@ impl RgSchedulingUnit {
         }
     }
 
-    /// Draws the next regular task from the active job list, rotating the arm and refilling the
-    /// list from the pending job queue as jobs run dry.
+    /// Finds the next regular task to dispatch without taking it out of the job that buffers it,
+    /// rotating the arm and refilling the active job list from the pending job queue as jobs run
+    /// dry.
     ///
     /// # Returns
     ///
     /// A tuple on success, containing:
     ///
-    /// * The key of the job the task was drawn from.
+    /// * The key of the job the task was found in.
     /// * That job's ID.
     /// * The task index to dispatch.
     ///
     /// [`None`] is returned if no active or pending job yields a task.
-    fn take_regular_task(
+    fn peek_regular_task(
         &mut self,
         job_registry: &mut JobRegistry,
         jobs_to_retire: &mut Vec<JobKey>,
@@ -294,7 +279,7 @@ impl RgSchedulingUnit {
                 }
                 continue;
             };
-            let Some(task_index) = entry.get_next_task() else {
+            let Some(task_index) = entry.peek_next_task() else {
                 entry.decrement_downgrade_counter();
                 if 0 == entry.downgrade_counter() {
                     self.downgrade_buffer.push(job_key);
@@ -309,6 +294,15 @@ impl RgSchedulingUnit {
             let job_id = entry.job_id();
             self.rr_arm += 1;
             return Some((job_key, job_id, task_index));
+        }
+    }
+
+    /// Takes the task read by [`Self::peek_regular_task`] out of the job `job_key` refers to.
+    ///
+    /// The call is a no-op if the job has been removed from the registry.
+    fn commit_regular_task(job_key: JobKey, job_registry: &mut JobRegistry) {
+        if let Some(entry) = job_registry.get_mut(job_key) {
+            entry.pop_next_task();
         }
     }
 
@@ -417,13 +411,4 @@ impl RgSchedulingUnit {
         }
         Ok(())
     }
-}
-
-/// A task taken out of the structure that buffered it, still owed a publication.
-enum TakenTask {
-    /// A finalization owed by the group, taken off the head of its finalize queue.
-    Finalization(JobId, FinalizeKind),
-
-    /// A regular task, taken out of the job entry it belongs to.
-    Regular(JobKey, TaskIndex),
 }

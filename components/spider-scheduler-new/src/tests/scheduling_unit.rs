@@ -4,10 +4,10 @@
 use super::DEFAULT_SESSION_ID;
 use super::make_job_entry;
 use super::make_unit;
-use crate::core::DOWNGRADE_LIVES;
 use crate::core::TaskAssignmentIdIssuer;
 use crate::dispatch_queue::GlobalDispatchQueue;
 use crate::error::MakeAssignmentError;
+use crate::job_registry::DOWNGRADE_LIVES;
 use crate::job_registry::JobKey;
 use crate::job_registry::JobRegistry;
 use crate::resource_group::ResourceGroupTable;
@@ -337,7 +337,7 @@ fn an_arriving_task_restores_a_downgraded_job() -> anyhow::Result<()> {
 }
 
 #[test]
-fn a_rejected_publication_returns_the_finalization_it_took() -> anyhow::Result<()> {
+fn a_rejected_publication_leaves_the_finalization_buffered() -> anyhow::Result<()> {
     let mut fixture = UnitFixture::new(1);
     fixture.add_job(JOB_A, 1)?;
     fixture.unit.push_finalization(JOB_B, FinalizeKind::Commit);
@@ -354,11 +354,12 @@ fn a_rejected_publication_returns_the_finalization_it_took() -> anyhow::Result<(
         Err(MakeAssignmentError::DispatchQueueClosed)
     );
     assert_eq!(fixture.unit.num_buffered_finalizations(), (1, 0));
+    assert!(fixture.unit.has_schedulable_task());
     Ok(())
 }
 
 #[test]
-fn a_rejected_publication_returns_the_regular_task_it_took() -> anyhow::Result<()> {
+fn a_rejected_publication_leaves_the_regular_task_buffered() -> anyhow::Result<()> {
     let mut fixture = UnitFixture::new(1);
     let job_a = fixture.add_job(JOB_A, 1)?;
     fixture.close_dispatch_queue();
@@ -374,5 +375,6 @@ fn a_rejected_publication_returns_the_regular_task_it_took() -> anyhow::Result<(
         Err(MakeAssignmentError::DispatchQueueClosed)
     );
     assert!(fixture.has_ready_task(job_a));
+    assert!(fixture.unit.has_schedulable_task());
     Ok(())
 }

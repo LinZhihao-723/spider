@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 
 use super::make_job_entry;
-use crate::core::DOWNGRADE_LIVES;
+use crate::job_registry::DOWNGRADE_LIVES;
 use crate::job_registry::JobEntry;
 use crate::job_registry::JobKey;
 use crate::job_registry::JobRegistry;
@@ -28,7 +28,7 @@ fn upsert_registers_a_new_job_and_appends_to_an_existing_one() -> anyhow::Result
 
     let entry = entry_of(&mut registry, job_key);
     let mut dispatched: Vec<TaskIndex> = Vec::new();
-    while let Some(task_index) = entry.get_next_task() {
+    while let Some(task_index) = entry.pop_next_task() {
         dispatched.push(task_index);
     }
     assert_eq!(dispatched, vec![0, 1, 7, 8]);
@@ -47,9 +47,9 @@ fn upsert_keeps_the_scheduling_position_of_an_existing_job() -> anyhow::Result<(
 
     // The entry the registry appended to must be the one the scheduling unit's key resolves to.
     let entry = entry_of(&mut registry, job_key);
-    assert_eq!(entry.get_next_task(), Some(0));
-    assert_eq!(entry.get_next_task(), Some(1));
-    assert_eq!(entry.get_next_task(), None);
+    assert_eq!(entry.pop_next_task(), Some(0));
+    assert_eq!(entry.pop_next_task(), Some(1));
+    assert_eq!(entry.pop_next_task(), None);
     Ok(())
 }
 
@@ -125,7 +125,7 @@ fn take_ready_tasks_empties_a_job_without_removing_it() -> anyhow::Result<()> {
     let entry = entry_of(&mut registry, job_key);
     assert_eq!(entry.take_ready_tasks(), VecDeque::from(vec![0, 1, 2]));
     assert!(!entry.has_ready_task());
-    assert_eq!(entry.get_next_task(), None);
+    assert_eq!(entry.pop_next_task(), None);
     assert_eq!(entry.take_ready_tasks(), VecDeque::new());
 
     assert_eq!(job_id_of(&mut registry, job_key), Some(JOB_ID));

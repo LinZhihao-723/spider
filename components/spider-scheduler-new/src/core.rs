@@ -702,9 +702,6 @@ fn run_core_to_completion<StorageClientType: SchedulerStorageClient>(
     runtime.block_on(core.run())
 }
 
-/// The number of chances a job that produced no task gets before it is retired.
-pub(crate) const DOWNGRADE_LIVES: u32 = 1;
-
 /// The updates one tick produced for a single resource group.
 #[derive(Default)]
 struct RgUpdate {
