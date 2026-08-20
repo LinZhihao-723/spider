@@ -1,7 +1,6 @@
 //! Unit tests for the hint channel and the two paths an execution manager pulls assignments
 //! through.
 
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use super::DEFAULT_SESSION_ID;
@@ -10,6 +9,7 @@ use super::make_assignment;
 use super::make_job_entry;
 use super::make_unit;
 use super::reader_of;
+use super::writer_of;
 use crate::core::TaskAssignmentIdIssuer;
 use crate::dispatch_queue::DispatchOutcome;
 use crate::dispatch_queue::DispatchService;
@@ -102,16 +102,14 @@ impl PublisherFixture {
     ///
     /// The group's outstanding hint count.
     fn living_hint(&self) -> usize {
-        reader_of(&self.rg_table, RG_ID, DEFAULT_SESSION_ID)
-            .living_hint()
-            .load(Ordering::Acquire)
+        writer_of(&self.rg_table, RG_ID, DEFAULT_SESSION_ID).living_hint()
     }
 
     /// # Returns
     ///
     /// The number of assignments currently queued for the group.
     fn queue_len(&self) -> usize {
-        reader_of(&self.rg_table, RG_ID, DEFAULT_SESSION_ID).len()
+        writer_of(&self.rg_table, RG_ID, DEFAULT_SESSION_ID).queue_len()
     }
 }
 
@@ -208,18 +206,35 @@ async fn a_stale_hint_on_an_empty_group_consumes_the_hint_and_yields_nothing() -
     Ok(())
 }
 
+#[test]
+fn a_hint_spend_against_no_outstanding_hint_clamps_the_count_at_zero() {
+    let rg_table = ResourceGroupTable::new();
+    let writer = writer_of(&rg_table, RG_ID, DEFAULT_SESSION_ID);
+    let reader = reader_of(&rg_table, RG_ID, DEFAULT_SESSION_ID);
+    assert_eq!(writer.living_hint(), 0);
+
+    assert_eq!(reader.consume_hint_and_try_recv(), None);
+    assert_eq!(writer.living_hint(), 0);
+
+    writer.decrement_living_hint();
+    assert_eq!(writer.living_hint(), 0);
+
+    writer.increment_living_hint();
+    assert_eq!(writer.living_hint(), 1);
+}
+
 #[tokio::test]
 async fn next_task_pinned_drops_an_assignment_published_in_a_stale_session() -> anyhow::Result<()> {
     const STALE_SESSION_ID: SessionId = DEFAULT_SESSION_ID;
     const CURRENT_SESSION_ID: SessionId = DEFAULT_SESSION_ID + 1;
 
     let (service, rg_table, _global_queue) = make_dispatch_service(CURRENT_SESSION_ID);
-    let endpoints = rg_table.get_or_create(RG_ID, CURRENT_SESSION_ID);
+    let writer = writer_of(&rg_table, RG_ID, CURRENT_SESSION_ID);
     let assignment = make_assignment(RG_ID, JOB_ID, TaskId::Index(0), STALE_SESSION_ID);
-    assert!(endpoints.sender.try_send(assignment).is_ok());
+    assert!(writer.try_send(assignment).is_ok());
 
     assert_eq!(service.next_task_pinned(RG_ID, DISPATCH_WAIT).await, None);
-    assert_eq!(endpoints.reader.len(), 0);
+    assert_eq!(writer.queue_len(), 0);
     Ok(())
 }
 
@@ -230,18 +245,15 @@ async fn next_task_general_drops_an_assignment_published_in_a_stale_session() ->
     const CURRENT_SESSION_ID: SessionId = DEFAULT_SESSION_ID + 1;
 
     let (service, rg_table, global_queue) = make_dispatch_service(CURRENT_SESSION_ID);
-    let endpoints = rg_table.get_or_create(RG_ID, CURRENT_SESSION_ID);
+    let writer = writer_of(&rg_table, RG_ID, CURRENT_SESSION_ID);
     let assignment = make_assignment(RG_ID, JOB_ID, TaskId::Index(0), STALE_SESSION_ID);
-    assert!(endpoints.sender.try_send(assignment).is_ok());
-    endpoints
-        .reader
-        .living_hint()
-        .fetch_add(1, Ordering::Release);
-    assert!(global_queue.try_send(endpoints.reader.clone()));
+    assert!(writer.try_send(assignment).is_ok());
+    writer.increment_living_hint();
+    assert!(global_queue.try_send(writer.hint()));
 
     assert_eq!(service.next_task_general(DISPATCH_WAIT).await, None);
-    assert_eq!(endpoints.reader.len(), 0);
-    assert_eq!(endpoints.reader.living_hint().load(Ordering::Acquire), 0);
+    assert_eq!(writer.queue_len(), 0);
+    assert_eq!(writer.living_hint(), 0);
     Ok(())
 }
 
@@ -252,17 +264,14 @@ async fn next_task_general_discards_a_stale_hint_without_touching_the_hint_count
     const CURRENT_SESSION_ID: SessionId = DEFAULT_SESSION_ID + 1;
 
     let (service, rg_table, global_queue) = make_dispatch_service(CURRENT_SESSION_ID);
-    let endpoints = rg_table.get_or_create(RG_ID, STALE_SESSION_ID);
+    let writer = writer_of(&rg_table, RG_ID, STALE_SESSION_ID);
     let assignment = make_assignment(RG_ID, JOB_ID, TaskId::Index(0), STALE_SESSION_ID);
-    assert!(endpoints.sender.try_send(assignment).is_ok());
-    endpoints
-        .reader
-        .living_hint()
-        .fetch_add(1, Ordering::Release);
-    assert!(global_queue.try_send(endpoints.reader.clone()));
+    assert!(writer.try_send(assignment).is_ok());
+    writer.increment_living_hint();
+    assert!(global_queue.try_send(writer.hint()));
 
     assert_eq!(service.next_task_general(DISPATCH_WAIT).await, None);
-    assert_eq!(endpoints.reader.living_hint().load(Ordering::Acquire), 1);
+    assert_eq!(writer.living_hint(), 1);
     Ok(())
 }
 
@@ -270,9 +279,9 @@ async fn next_task_general_discards_a_stale_hint_without_touching_the_hint_count
 async fn next_task_pinned_classifies_an_already_queued_assignment_as_immediate()
 -> anyhow::Result<()> {
     let (service, rg_table, _global_queue) = make_dispatch_service(DEFAULT_SESSION_ID);
-    let endpoints = rg_table.get_or_create(RG_ID, DEFAULT_SESSION_ID);
+    let writer = writer_of(&rg_table, RG_ID, DEFAULT_SESSION_ID);
     let assignment = make_assignment(RG_ID, JOB_ID, TaskId::Index(0), DEFAULT_SESSION_ID);
-    assert!(endpoints.sender.try_send(assignment).is_ok());
+    assert!(writer.try_send(assignment).is_ok());
 
     assert_eq!(
         service
@@ -287,12 +296,11 @@ async fn next_task_pinned_classifies_an_already_queued_assignment_as_immediate()
 async fn next_task_pinned_classifies_an_assignment_published_after_the_request_as_waited()
 -> anyhow::Result<()> {
     let (service, rg_table, _global_queue) = make_dispatch_service(DEFAULT_SESSION_ID);
-    let endpoints = rg_table.get_or_create(RG_ID, DEFAULT_SESSION_ID);
+    let writer = writer_of(&rg_table, RG_ID, DEFAULT_SESSION_ID);
     let assignment = make_assignment(RG_ID, JOB_ID, TaskId::Index(0), DEFAULT_SESSION_ID);
-    let sender = endpoints.sender.clone();
     let publisher = tokio::spawn(async move {
         tokio::time::sleep(PUBLISH_DELAY).await;
-        sender.try_send(assignment).is_ok()
+        writer.try_send(assignment).is_ok()
     });
 
     let outcome = service
@@ -308,14 +316,11 @@ async fn next_task_pinned_classifies_an_assignment_published_after_the_request_a
 async fn next_task_general_classifies_an_already_hinted_assignment_as_immediate()
 -> anyhow::Result<()> {
     let (service, rg_table, global_queue) = make_dispatch_service(DEFAULT_SESSION_ID);
-    let endpoints = rg_table.get_or_create(RG_ID, DEFAULT_SESSION_ID);
+    let writer = writer_of(&rg_table, RG_ID, DEFAULT_SESSION_ID);
     let assignment = make_assignment(RG_ID, JOB_ID, TaskId::Index(0), DEFAULT_SESSION_ID);
-    assert!(endpoints.sender.try_send(assignment).is_ok());
-    endpoints
-        .reader
-        .living_hint()
-        .fetch_add(1, Ordering::Release);
-    assert!(global_queue.try_send(endpoints.reader.clone()));
+    assert!(writer.try_send(assignment).is_ok());
+    writer.increment_living_hint();
+    assert!(global_queue.try_send(writer.hint()));
 
     assert_eq!(
         service.next_task_general_classified(DISPATCH_WAIT).await,
@@ -328,19 +333,16 @@ async fn next_task_general_classifies_an_already_hinted_assignment_as_immediate(
 async fn next_task_general_classifies_a_hint_published_after_the_request_as_waited()
 -> anyhow::Result<()> {
     let (service, rg_table, global_queue) = make_dispatch_service(DEFAULT_SESSION_ID);
-    let endpoints = rg_table.get_or_create(RG_ID, DEFAULT_SESSION_ID);
+    let writer = writer_of(&rg_table, RG_ID, DEFAULT_SESSION_ID);
     let assignment = make_assignment(RG_ID, JOB_ID, TaskId::Index(0), DEFAULT_SESSION_ID);
     let publisher = tokio::spawn(async move {
         tokio::time::sleep(PUBLISH_DELAY).await;
-        if endpoints.sender.try_send(assignment).is_err() {
+        if writer.try_send(assignment).is_err() {
             return false;
         }
-        endpoints
-            .reader
-            .living_hint()
-            .fetch_add(1, Ordering::Release);
+        writer.increment_living_hint();
 
-        global_queue.try_send(endpoints.reader.clone())
+        global_queue.try_send(writer.hint())
     });
 
     let outcome = service.next_task_general_classified(DISPATCH_WAIT).await;

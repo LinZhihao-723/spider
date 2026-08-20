@@ -6,7 +6,6 @@
 //! registry the core hands in; a key that fails to resolve is a job that has been removed.
 
 use std::collections::VecDeque;
-use std::sync::atomic::Ordering;
 
 use crate::core::TaskAssignmentIdIssuer;
 use crate::dispatch_queue::GlobalDispatchQueue;
@@ -14,7 +13,7 @@ use crate::error::MakeAssignmentError;
 use crate::job_registry::JobKey;
 use crate::job_registry::JobRegistry;
 use crate::resource_group::RgDispatchQueueEndpoints;
-use crate::resource_group::RgDispatchQueueReader;
+use crate::resource_group::RgDispatchQueueWriter;
 use crate::types::FinalizeKind;
 use crate::types::JobId;
 use crate::types::ResourceGroupId;
@@ -43,8 +42,7 @@ pub struct RgSchedulingUnit {
     finalize_queue: VecDeque<(JobId, FinalizeKind)>,
     num_buffered_commits: usize,
     num_buffered_cleanups: usize,
-    dispatch_queue_sender: async_channel::Sender<TaskAssignment>,
-    reader: RgDispatchQueueReader,
+    writer: RgDispatchQueueWriter,
     downgrade_buffer: Vec<JobKey>,
     active_job_list_capacity: usize,
 }
@@ -57,7 +55,7 @@ impl RgSchedulingUnit {
     /// A newly created, inactive unit publishing into `endpoints`.
     pub fn new(
         rg_id: ResourceGroupId,
-        endpoints: RgDispatchQueueEndpoints,
+        endpoints: &RgDispatchQueueEndpoints,
         active_job_list_capacity: usize,
     ) -> Self {
         Self {
@@ -69,8 +67,7 @@ impl RgSchedulingUnit {
             finalize_queue: VecDeque::new(),
             num_buffered_commits: 0,
             num_buffered_cleanups: 0,
-            dispatch_queue_sender: endpoints.sender,
-            reader: endpoints.reader,
+            writer: endpoints.writer(),
             downgrade_buffer: Vec::new(),
             active_job_list_capacity,
         }
@@ -80,7 +77,7 @@ impl RgSchedulingUnit {
     ///
     /// The number of assignments currently queued for the group.
     pub fn dispatch_queue_size(&self) -> usize {
-        self.reader.len()
+        self.writer.queue_len()
     }
 
     /// # Returns
@@ -383,7 +380,7 @@ impl RgSchedulingUnit {
             task_id,
             session_id,
         };
-        self.dispatch_queue_sender
+        self.writer
             .try_send(assignment)
             .map_err(|_| MakeAssignmentError::DispatchQueueClosed)?;
 
@@ -392,18 +389,17 @@ impl RgSchedulingUnit {
         // for an assignment that is not yet visible.
         //
         // `S` must likewise be sampled before `H`, per the memory-ordering argument in design §8.1.
-        let dispatch_queue_size = self.dispatch_queue_size();
-        let living_hint = self.reader.living_hint();
-        if living_hint.load(Ordering::Acquire) >= dispatch_queue_size {
+        let dispatch_queue_size = self.writer.queue_len();
+        if self.writer.living_hint() >= dispatch_queue_size {
             return Ok(());
         }
 
-        living_hint.fetch_add(1, Ordering::Release);
-        if !global_queue.try_send(self.reader.clone()) {
+        self.writer.increment_living_hint();
+        if !global_queue.try_send(self.writer.hint()) {
             // The hint channel is unbounded, so this is unreachable unless it was closed. The
             // counter must still be restored, or the group would be credited with a pop attempt
             // nobody will make.
-            living_hint.fetch_sub(1, Ordering::AcqRel);
+            self.writer.decrement_living_hint();
             tracing::error!(
                 rg_id = ? self.rg_id,
                 "Failed to publish a dispatch hint."

@@ -19,7 +19,7 @@ The scheduler core is a single-threaded, tick-based loop that drains ready tasks
 
 Two properties drive the structure:
 
-- **An assignment is stored exactly once.** It lives in its resource group's queue and nowhere else, so exactly-once dispatch is structural rather than protocol-enforced. General execution managers are steered by a separate channel of *hints* carrying no payload.
+- **An assignment is stored exactly once.** It lives in its resource group's queue and nowhere else, so exactly-once dispatch is structural rather than protocol-enforced. General execution managers are steered by a separate *broadcast queue* of hints carrying no payload.
 - **Buffer space is accounted per resource group.** A single shared queue would converge to being owned by whichever group drains slowest, starving every other group of dispatch slots. Per-group queues with a threshold derived from live free space prevent that.
 
 ## 2. Components
@@ -33,7 +33,7 @@ Two properties drive the structure:
 | `rg_table` (dispatch queue endpoints) | resource group registry | **yes**, via `Arc<DashMap<…>>` |
 | `rg_units` (scheduling state) | core | no |
 | Active RG list | core | no |
-| Global dispatch queue (hints) | core writes, service reads | **yes** |
+| Broadcast queue (hints) | core writes, service reads | **yes** |
 | Reschedule queue | EM registry writes, core reads | — |
 | Session manager | spider-execution-manager | **yes** |
 
@@ -122,7 +122,9 @@ struct RgDispatchQueueEndpoints {
 }
 
 #[derive(Clone)]
-struct RgDispatchQueueReader(Arc<RgDispatchQueueReaderInner>);
+struct RgDispatchQueueReader {
+    inner: Arc<RgDispatchQueueReaderInner>,
+}
 
 struct RgDispatchQueueReaderInner {
     receiver: async_channel::Receiver<TaskAssignment>,
@@ -130,11 +132,22 @@ struct RgDispatchQueueReaderInner {
     rg_id: ResourceGroupId,
     session_id: SessionId,               // session in which this RG was created
 }
+
+struct RgDispatchQueueWriter {
+    sender: async_channel::Sender<TaskAssignment>,
+    reader: RgDispatchQueueReader,
+}
 ```
 
-Both endpoints live in the table because **either side may create a resource group first**. A pinned execution manager can connect before any task for its group has been scheduled, so the service creates the channel pair on demand and blocks on the reader. When the core first schedules into that group it performs the same create-or-get and clones the sender and `living_hint` into its scheduling unit.
+The two sides of a group's queue are two types. The **reader** is the read side and the only path that may take from the queue: it reports `rg_id` and `session_id`, blocks a pinned execution manager on `recv_pinned`, and serves a general one with `consume_hint_and_try_recv`. The **writer** is the write side — `try_send` to publish an assignment, `queue_len` for the group's current occupancy `S`, `living_hint` for the count `H` **by value**, `increment_living_hint` and `decrement_living_hint`, and `hint`, which returns the reader clone the broadcast queue carries ([§3.5](#35-broadcast-queue)). The writer carries no `Arc` of its own: exactly one scheduling unit owns a group's writer, and the reader inside it is already the shared handle.
 
-Methods: `get_dispatch_queue_reader(rg_id)` (create if absent, used by the service), `get_or_create(rg_id)` (used by the core), `clear()`.
+**The writer holds a reader clone, not a bare counter handle.** The counter and the sender are two halves of one group's queue, and handing them to the scheduling unit separately would make a mismatched pair constructible — a sender for one group next to a counter for another, which nothing in the type system rejects and which would publish assignments into one queue while hinting for a different one. Pairing them inside the writer fixes the correspondence at construction, and the unit never sees the two separately. The writer reaches the counter through its reader's private `inner`, which is legal because both types live in the same module: the reader exposes no accessor to anyone, and the writer is not "anyone".
+
+**The read side has no way to observe or modify the counter other than `consume_hint_and_try_recv`.** The reader publishes neither the count nor a handle to it, so "decrement, then attempt the pop" is not a convention a call site is trusted to follow but the only shape the read side can express. This is a design property, not an implementation detail: the requirements of [§8.2](#82-requirements-the-proof-depends-on) that constrain the consumer — the decrement being immediate, and paired with exactly one pop attempt — hold for every caller because there is no second way to touch `H`.
+
+Both endpoints live in the table because **either side may create a resource group first**. A pinned execution manager can connect before any task for its group has been scheduled, so the service creates the channel pair on demand and blocks on the reader. When the core first schedules into that group it performs the same create-or-get and takes the group's writer into its scheduling unit.
+
+Methods on the table: `get_dispatch_queue_reader(rg_id)` (create if absent, used by the service), `get_or_create(rg_id)` (used by the core), `clear()`. `RgDispatchQueueEndpoints::writer()` packs the entry's sender together with a clone of *that entry's* reader; it is the only way a writer is built.
 
 **Core-private:**
 
@@ -155,8 +168,7 @@ struct RgSchedulingUnit {
     active_jobs: Vec<JobKey>,                // capacity: active_job_list_capacity
     pending_jobs: VecDeque<JobKey>,
     finalize_queue: VecDeque<(JobId, FinalizeKind)>,
-    dispatch_queue_sender: async_channel::Sender<TaskAssignment>,
-    living_hint: Arc<AtomicUsize>,           // shared with RgDispatchQueueReader
+    writer: RgDispatchQueueWriter,
     rr_arm: usize,                           // index into active_jobs
     is_active: bool,
 }
@@ -166,11 +178,22 @@ enum FinalizeKind { Commit, Cleanup }
 
 `finalize_queue` carries the kind because commit and cleanup dispatch different task IDs.
 
-### 3.5 Global dispatch queue
+### 3.5 Broadcast queue
 
 An **unbounded** `async_channel` of `RgDispatchQueueReader`.
 
-Its elements are **hints**: "there may be work in this resource group." They carry no assignment. A hint is published only when the publishing rule in [§5.4](#54-step-4--dispatch-queue-filling) is satisfied, which caps each group's outstanding hints at that group's peak queue occupancy ([§8.1](#81-coverage)). The channel must be unbounded because those peaks are not simultaneous: their sum can exceed `dispatch_queue_capacity`, and a rejected hint send would break the coverage invariant with no way to detect or repair it.
+Every element is a **hint**, and a hint names a resource group and nothing else: it is what tells a general execution manager which group to try next, so that general capacity rotates over the groups rather than favouring whichever one it happened to look at. Hints are the only mechanism steering general execution managers; a pinned one never consults the broadcast queue at all.
+
+A hint is an invitation, not a promise, and it is worth being explicit about how weak a claim it makes:
+
+- **A hint does not guarantee an entry.** By the time its holder reaches the named group's queue, a pinned execution manager may have taken the assignment the hint was published for. The holder then finds the queue empty, discards the hint, and moves on to the next one. §8.1 shows this costs nothing: a hint is consumed either way, and coverage is maintained over the group's whole queue rather than over any individual assignment.
+- **A hint does not name an entry.** It says only "try this group". If the group's queue holds several assignments, which one the holder receives is whatever the channel yields — the hint carries no claim on a particular assignment, and two holders of hints for the same group take different assignments without coordinating.
+
+The **living hint** counter, `living_hint`, is the per-group half of this structure: an atomic count of how many hints naming that group are currently outstanding in the broadcast queue. The core increments it when it publishes a hint and a general execution manager decrements it when it takes one, so the count is what the publishing rule of [§5.4](#54-step-4--dispatch-queue-filling) consults to decide whether another hint is needed. That rule caps each group's outstanding hints at that group's peak queue occupancy ([§8.1](#81-coverage)).
+
+The counter is a plain `AtomicUsize` inside `RgDispatchQueueReaderInner` ([§3.4](#34-resource-group-registry)), not a separately shared handle. The reader's `Arc` is the one sharing mechanism the group's queue has, and the writer reaches the counter through the reader clone it holds — which is why a hint and the counter it accounts for can never name different groups.
+
+The queue must be unbounded because those peaks are not simultaneous: their sum can exceed `dispatch_queue_capacity`, and a rejected hint send would break the coverage invariant with no way to detect or repair it.
 
 Sending a hint clones an `Arc`, not a channel receiver.
 
@@ -233,7 +256,7 @@ struct RgUpdate {
 
 For each entry in `rg_updates`:
 
-- Look the group up in `rg_index`. If absent, create the scheduling unit (via `rg_table.get_or_create`, cloning the sender and `living_hint`), push it onto `rg_units`, and record its index in `rg_index`. This is the only place either is written.
+- Look the group up in `rg_index`. If absent, create the scheduling unit (via `rg_table.get_or_create`, taking the group's writer), push it onto `rg_units`, and record its index in `rg_index`. This is the only place either is written.
 - Append the finalized jobs to `finalize_queue`.
 - Place each new job key: append to `active_jobs` if it is below `active_job_list_capacity`, otherwise push to the back of `pending_jobs`.
 - If `is_active` is false, set it and append the unit's index to `active_rg_list`.
@@ -244,7 +267,7 @@ Only newly created job entries need placement: an entry that already existed is 
 
 This is the scheduling policy. The active RG list is **not** modified during the step; a per-tick copy `rg_rr_list` is used, and deactivations are buffered and applied at the end.
 
-**a. Set up.** Destructure the core's fields — `rg_units`, the job registry, the global task set, the global dispatch queue writer — into separate `&mut` bindings, so the step's inner operations borrow disjoint parts of the core rather than the whole of it. See [`try_make_assignment`](#try_make_assignment) below. Create `jobs_to_retire: Vec<JobKey>`.
+**a. Set up.** Destructure the core's fields — `rg_units`, the job registry, the global task set, the broadcast queue writer — into separate `&mut` bindings, so the step's inner operations borrow disjoint parts of the core rather than the whole of it. See [`try_make_assignment`](#try_make_assignment) below. Create `jobs_to_retire: Vec<JobKey>`.
 
 **b. Single pass over `active_rg_list`** doing three things at once:
 
@@ -264,7 +287,7 @@ Set `arm = (k + 1) % rg_rr_list.len()`, or `0` if `last_served_rg` is absent fro
 loop {
     if F == 0 || rg_rr_list.is_empty() { break }
     let unit = &mut rg_units[rg_rr_list[arm]];
-    match unit.try_make_assignment(&mut F, job_registry, &global_writer) {
+    match unit.try_make_assignment(&mut F, job_registry, &broadcast_writer) {
         Ok((job_id, task_id)) => {
             global_task_set.remove(&(job_id, task_id));
             F -= 1;
@@ -289,7 +312,7 @@ Note the two removals are distinct. Removal from `rg_rr_list` means "nothing mor
 
 #### `try_make_assignment`
 
-A method on `RgSchedulingUnit`, taking `&mut F`, `&mut JobRegistry`, and the global dispatch queue writer as parameters. It needs `&mut RgSchedulingUnit` and `&mut` the job arena **at the same time**: it reads and mutates the unit's `active_jobs` and `rr_arm` while resolving the keys they hold into entries it pops tasks from.
+A method on `RgSchedulingUnit`, taking `&mut F`, `&mut JobRegistry`, and the broadcast queue writer as parameters. It needs `&mut RgSchedulingUnit` and `&mut` the job arena **at the same time**: it reads and mutates the unit's `active_jobs` and `rr_arm` while resolving the keys they hold into entries it pops tasks from.
 
 That is why it is a method on the unit and not on the core. `self.rg_units[i].try_make_assignment(&mut self.job_registry, …)` reached through a method on the core's `&mut self` is rejected — the method call borrows all of `self`, so the argument cannot borrow a field of it. The caller therefore destructures the core's fields first ([step a](#54-step-4--dispatch-queue-filling)) and passes two disjoint `&mut` bindings, which the borrow checker accepts because they name different fields. This is checked statically: there is no runtime borrow to fail.
 
@@ -299,9 +322,9 @@ That is why it is a method on the unit and not on the core. `self.rg_units[i].tr
 4. Otherwise take a regular task:
    - Resolve the key of the active job at `rr_arm`. If it does not resolve, the job has been removed — swap it out for the next key in `pending_jobs` that does resolve.
    - Call `get_next_task()` on the resolved entry. If it yields nothing, decrement that job's `downgrade_counter`; if the counter reaches zero, buffer the job for downgrade and swap in the next pending job, otherwise advance `rr_arm` to the next active job.
-5. Publish the resulting assignment **in this order**:
-   - `dispatch_queue_sender.try_send(assignment)` — into the group's own queue first, so a pinned execution manager can take it immediately;
-   - then compare `living_hint` `H` against the group's current queue size `S`. If `H >= S`, done. Otherwise increment `H` and send this unit's `RgDispatchQueueReader` to the global dispatch queue.
+5. Publish the resulting assignment through the unit's writer, **in this order**:
+   - `writer.try_send(assignment)` — into the group's own queue first, so a pinned execution manager can take it immediately;
+   - then compare `writer.living_hint()` `H` against `writer.queue_len()` `S`. If `H >= S`, done. Otherwise `writer.increment_living_hint()` and send `writer.hint()` — a reader clone — to the broadcast queue. Should that send ever fail, `writer.decrement_living_hint()` rolls the count back; the queue is unbounded, so it cannot fail for want of capacity ([§8.2](#82-requirements-the-proof-depends-on)), and the rollback exists so that a failure which is not supposed to happen cannot leave `H` overstating coverage.
 
 The ordering in step 5 is normative; reversing it lets a general execution manager consume a hint for an assignment that is not yet visible. See [§8](#8-invariants).
 
@@ -381,16 +404,15 @@ The rotation in [§5.4](#54-step-4--dispatch-queue-filling) satisfies both.
 
 ### 7.1 Pinned execution manager
 
-The service looks up the group in `rg_table`, creating it if absent, and clones the `RgDispatchQueueReader`. It then blocks on the receiver until an assignment arrives or the request's wait time expires.
+The service looks up the group in `rg_table`, creating it if absent, and clones the `RgDispatchQueueReader`. It then blocks on `recv_pinned` until an assignment arrives or the request's wait time expires.
 
 The reader is re-fetched per request, so a session bump that replaces `rg_table` is picked up on the next call.
 
 ### 7.2 General execution manager
 
-The service blocks on the global dispatch queue. On receiving an `RgDispatchQueueReader`:
+The service blocks on the broadcast queue. On receiving an `RgDispatchQueueReader` it calls `consume_hint_and_try_recv`, which decrements `living_hint` — **immediately, with no await point between the receive and the decrement** — and then attempts one `try_recv` on the group's queue. On success the assignment is returned. On empty the hint was stale: the service moves on to the next hint.
 
-- decrement `living_hint` — **immediately, with no await point between the receive and the decrement**;
-- `try_recv` the group's queue. On success, return the assignment. On empty, the hint was stale: move on to the next hint.
+The decrement and the pop attempt are one method rather than two steps at the call site because that is the only counter access the read side has ([§3.4](#34-resource-group-registry)); a caller cannot decrement twice, decrement without attempting, or await in between.
 
 No republication is required. The core's per-admission check alone maintains coverage.
 
@@ -431,9 +453,9 @@ The last step uses `S ≥ q`, which holds because the assignment is sent to the 
 
 **The check never under-publishes.** The implementation tests `H < S`, not `C < q`. Since `m ≥ 0` and `S ≥ q`, `C < q ⟹ H ≤ C < q ≤ S ⟹ H < S`, so whenever a hint is required the check fires. The converse does not hold, so it occasionally publishes when it need not — over-publication, which costs a bounded number of stale hints and no correctness.
 
-**The hint channel needs no garbage collection, but it cannot be statically bounded.** Immediately after any check, `H ≤ S`, and `H` increases only via that check, so `H` never exceeds that group's *peak* queue occupancy. Each group's hint share is therefore self-limiting, and stale hints are consumed and discarded by the general execution managers that encounter them.
+**The broadcast queue needs no garbage collection, but it cannot be statically bounded.** Immediately after any check, `H ≤ S`, and `H` increases only via that check, so `H` never exceeds that group's *peak* queue occupancy. Each group's hint share is therefore self-limiting, and stale hints are consumed and discarded by the general execution managers that encounter them.
 
-It does **not** follow that the total is bounded by `dispatch_queue_capacity`. `H` is decremented only by a general execution manager, so a pinned execution manager draining a group lowers `S` while leaving `H` at the old peak. The bound is `Σ_r peak(S_r)`, and those peaks are not simultaneous — a group backlogged alone reaches `B/2` under α = 1, so `N` groups that go backlogged in turn, each drained by its own pinned execution managers, can leave up to `N·B/2` hints outstanding with the buffer empty. The channel is therefore unbounded ([§3.5](#35-global-dispatch-queue)); the alternative is a rejected send, which breaks the invariant silently.
+It does **not** follow that the total is bounded by `dispatch_queue_capacity`. `H` is decremented only by a general execution manager, so a pinned execution manager draining a group lowers `S` while leaving `H` at the old peak. The bound is `Σ_r peak(S_r)`, and those peaks are not simultaneous — a group backlogged alone reaches `B/2` under α = 1, so `N` groups that go backlogged in turn, each drained by its own pinned execution managers, can leave up to `N·B/2` hints outstanding with the buffer empty. The queue is therefore unbounded ([§3.5](#35-broadcast-queue)); the alternative is a rejected send, which breaks the invariant silently.
 
 **Memory ordering.** `living_hint` is incremented only by the core and decremented only by general execution managers, so the check-then-increment needs no compare-exchange: a decrement landing between the read and the increment only lowers `H` further, which strengthens the condition that triggered publication. `Acquire`/`Release` suffices; sequential consistency is not required. Under acquire-release the core may miss a concurrent decrement and read `H` too high, skipping a publication — which is safe, because an unobserved decrement corresponds precisely to an execution manager that has entered flight and is therefore already counted in `m`.
 
@@ -442,8 +464,8 @@ It does **not** follow that the total is bounded by `dispatch_queue_capacity`. `
 Four, each of which fails silently:
 
 1. The assignment is sent to the group's queue **before** `H` is compared against `S`.
-2. Neither send may block or fail. **No channel in this design is bounded by its type** — both the per-group queues and the hint channel are unbounded, and the algorithm is what bounds them. The admission threshold `S < F` is the sole limit on a group's occupancy, and hence on the buffer's; the publishing rule `H < S` is the sole limit on a group's hints. A channel capacity would be a redundant second limit measured against the wrong quantity — a per-group bound against a buffer-wide budget — whose only reachable effect is to reject a send the proof requires to succeed.
-3. No await point between the global queue receive and `H -= 1`, so cancellation cannot strand a decrement. The region must also not panic.
+2. Neither send may block or fail. **No channel in this design is bounded by its type** — both the per-group queues and the broadcast queue are unbounded, and the algorithm is what bounds them. The admission threshold `S < F` is the sole limit on a group's occupancy, and hence on the buffer's; the publishing rule `H < S` is the sole limit on a group's hints. A channel capacity would be a redundant second limit measured against the wrong quantity — a per-group bound against a buffer-wide budget — whose only reachable effect is to reject a send the proof requires to succeed.
+3. No await point between the broadcast queue receive and `H -= 1`, so cancellation cannot strand a decrement. The region must also not panic.
 4. Hints carry a session generation; a general execution manager holding a stale-generation hint discards it **without touching any counter**.
 
 ### 8.3 Other invariants
@@ -462,11 +484,11 @@ No path in the design needs two job entries mutably at once. One that did would 
 
 Detected in step 1 from the session ID returned by the inbound-queue gRPC calls, and applied at the end of that step, in this order:
 
-1. **Bump the global session ID.** Assignments already taken from the global dispatch queue now fail their session check and are dropped by the service.
+1. **Bump the global session ID.** Assignments already taken from the broadcast queue now fail their session check and are dropped by the service.
 2. **Clear the resource group registry** — every entry in `rg_table`, and `rg_units`, `rg_index`, and `active_rg_list` **together, in this one operation**.
 3. **Clear the job registry** — both `jobs` and `by_job_id`.
 4. **Clear the global task set and the finalized job table.** Required: storage replays its ready tasks after a bump, and stale dedup entries would cause every replayed task to be dropped with nothing left in the registry to schedule it from.
-5. **Drain the global dispatch queue.**
+5. **Drain the broadcast queue.**
 
 Per-group queues are not drained explicitly; they are dropped with `rg_table`. An execution manager still blocked on an old reader keeps it alive but its assignments fail the session check.
 
@@ -493,3 +515,8 @@ Job keys need no such care. A key held across the bump fails to resolve against 
 - **General capacity is distributed proportionally to backlog**, not equally per group, because hint volume tracks queue occupancy. This is what makes the "pinned execution managers went offline" case self-correcting, with no health signal required.
 - **No minimum guarantee per resource group.** If per-tenant SLAs become necessary, the shape to adopt is a guaranteed floor with elastic borrowing above it, layered on the threshold rather than replacing it.
 - **An assignment dispatched but not delivered is not recovered here.** That window is covered by the EM registry's liveness path.
+
+## 12. Prototyping and benchmark
+
+- Prototyping branch: [spider/components/spider-scheduler-new at spider-scheduler-new-prototyping · LinZhihao-723/spider](https://github.com/LinZhihao-723/spider/tree/spider-scheduler-new-prototyping/components/spider-scheduler-new)
+- Benchmark result: [spider/claude/scheduler-redesign at spider-scheduler-new-prototyping · LinZhihao-723/spider](https://github.com/LinZhihao-723/spider/tree/spider-scheduler-new-prototyping/claude/scheduler-redesign)

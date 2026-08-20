@@ -451,7 +451,7 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
         let unit_index = self.rg_units.len();
         self.rg_units.push(RgSchedulingUnit::new(
             rg_id,
-            endpoints,
+            &endpoints,
             self.config.active_job_list_capacity.get(),
         ));
         self.rg_index.insert(rg_id, unit_index);

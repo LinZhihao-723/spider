@@ -55,6 +55,7 @@ use crate::job_registry::JobRegistry;
 use crate::job_registry::UpsertOutcome;
 use crate::resource_group::ResourceGroupTable;
 use crate::resource_group::RgDispatchQueueReader;
+use crate::resource_group::RgDispatchQueueWriter;
 use crate::scheduling_unit::RgSchedulingUnit;
 use crate::session::SessionManager;
 use crate::types::JobId;
@@ -199,7 +200,7 @@ impl CoreFixture {
     ///
     /// The number of assignments currently queued for `rg_id`.
     fn queue_len(&self, rg_id: ResourceGroupId) -> usize {
-        self.reader(rg_id).len()
+        writer_of(&self.rg_table, rg_id, self.session_manager.current()).queue_len()
     }
 
     /// # Returns
@@ -262,7 +263,7 @@ fn make_unit(
 ) -> RgSchedulingUnit {
     RgSchedulingUnit::new(
         rg_id,
-        rg_table.get_or_create(rg_id, session_id),
+        &rg_table.get_or_create(rg_id, session_id),
         active_job_list_capacity,
     )
 }
@@ -318,6 +319,18 @@ fn reader_of(
     session_id: SessionId,
 ) -> RgDispatchQueueReader {
     rg_table.get_dispatch_queue_reader(rg_id, session_id)
+}
+
+/// # Returns
+///
+/// The write side of `rg_id`'s dispatch queue, creating the group in `session_id` if the table has
+/// no entry for it.
+fn writer_of(
+    rg_table: &ResourceGroupTable,
+    rg_id: ResourceGroupId,
+    session_id: SessionId,
+) -> RgDispatchQueueWriter {
+    rg_table.get_or_create(rg_id, session_id).writer()
 }
 
 /// Takes every assignment currently queued behind `reader`, playing a pinned execution manager,
