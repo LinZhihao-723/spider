@@ -15,6 +15,8 @@ use super::drain_reader;
 use super::make_assignment;
 use super::make_config;
 use super::make_idle_storage;
+use crate::error::CoreError;
+use crate::error::MakeAssignmentError;
 use crate::harness::FakeStorage;
 use crate::harness::FakeStorageConfig;
 use crate::types::JobId;
@@ -304,6 +306,60 @@ async fn a_rescheduled_assignment_is_readmitted() -> anyhow::Result<()> {
     assert_eq!(redispatched.len(), 1);
     assert_eq!(redispatched[0].task_id, LOST_TASK_ID);
     assert_eq!(redispatched[0].job_id, JobId::from(0));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_closed_dispatch_queue_fails_the_tick() -> anyhow::Result<()> {
+    const DISPATCH_QUEUE_CAPACITY: usize = 4;
+
+    let mut fixture = CoreFixture::new(
+        make_config(
+            DISPATCH_QUEUE_CAPACITY,
+            ACTIVE_JOB_LIST_CAPACITY,
+            PENDING_POLL_TIMEOUT_MS,
+        ),
+        make_idle_storage(),
+    );
+    fixture.seed_job(RG_A, JobId::from(0), 4)?;
+    fixture.close_dispatch_queue(RG_A);
+
+    let CoreError::FatalPublication(err) = fixture
+        .core
+        .tick()
+        .await
+        .expect_err("a closed dispatch queue fails the tick")
+    else {
+        bail!("the tick failed with something other than a fatal publication failure");
+    };
+    assert_eq!(err, MakeAssignmentError::DispatchQueueClosed);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_closed_broadcast_queue_fails_the_tick() -> anyhow::Result<()> {
+    const DISPATCH_QUEUE_CAPACITY: usize = 4;
+
+    let mut fixture = CoreFixture::new(
+        make_config(
+            DISPATCH_QUEUE_CAPACITY,
+            ACTIVE_JOB_LIST_CAPACITY,
+            PENDING_POLL_TIMEOUT_MS,
+        ),
+        make_idle_storage(),
+    );
+    fixture.seed_job(RG_A, JobId::from(0), 4)?;
+    fixture.close_broadcast_queue();
+
+    let CoreError::FatalPublication(err) = fixture
+        .core
+        .tick()
+        .await
+        .expect_err("a closed broadcast queue fails the tick")
+    else {
+        bail!("the tick failed with something other than a fatal publication failure");
+    };
+    assert_eq!(err, MakeAssignmentError::BroadcastQueueClosed);
     Ok(())
 }
 

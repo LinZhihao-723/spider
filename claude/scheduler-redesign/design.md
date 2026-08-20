@@ -139,7 +139,7 @@ struct RgDispatchQueueWriter {
 }
 ```
 
-The two sides of a group's queue are two types. The **reader** is the read side and the only path that may take from the queue: it reports `rg_id` and `session_id`, blocks a pinned execution manager on `recv_pinned`, and serves a general one with `consume_hint_and_try_recv`. The **writer** is the write side — `try_send` to publish an assignment, `queue_len` for the group's current occupancy `S`, `living_hint` for the count `H` **by value**, `increment_living_hint` and `decrement_living_hint`, and `hint`, which returns the reader clone the broadcast queue carries ([§3.5](#35-broadcast-queue)). The writer carries no `Arc` of its own: exactly one scheduling unit owns a group's writer, and the reader inside it is already the shared handle.
+The two sides of a group's queue are two types. The **reader** is the read side and the only path that may take from the queue: it reports `rg_id` and `session_id`, blocks a pinned execution manager on `recv_pinned`, and serves a general one with `consume_hint_and_try_recv`. The **writer** is the write side — `try_send` to publish an assignment, `queue_len` for the group's current occupancy `S`, `living_hint` for the count `H` **by value**, `increment_living_hint`, and `hint`, which returns the reader clone the broadcast queue carries ([§3.5](#35-broadcast-queue)). The writer carries no `Arc` of its own: exactly one scheduling unit owns a group's writer, and the reader inside it is already the shared handle. The write side can only ever raise `H`: there is no decrement on the writer, because the single event that would have rolled the count back — a hint send that fails — is fatal, and a core that is about to stop has no later reader of `H` to mislead ([§8.3](#83-other-invariants)).
 
 **The writer holds a reader clone, not a bare counter handle.** The counter and the sender are two halves of one group's queue, and handing them to the scheduling unit separately would make a mismatched pair constructible — a sender for one group next to a counter for another, which nothing in the type system rejects and which would publish assignments into one queue while hinting for a different one. Pairing them inside the writer fixes the correspondence at construction, and the unit never sees the two separately. The writer reaches the counter through its reader's private `inner`, which is legal because both types live in the same module: the reader exposes no accessor to anyone, and the writer is not "anyone".
 
@@ -192,6 +192,8 @@ A hint is an invitation, not a promise, and it is worth being explicit about how
 The **living hint** counter, `living_hint`, is the per-group half of this structure: an atomic count of how many hints naming that group are currently outstanding in the broadcast queue. The core increments it when it publishes a hint and a general execution manager decrements it when it takes one, so the count is what the publishing rule of [§5.4](#54-step-4--dispatch-queue-filling) consults to decide whether another hint is needed. That rule caps each group's outstanding hints at that group's peak queue occupancy ([§8.1](#81-coverage)).
 
 The counter is a plain `AtomicUsize` inside `RgDispatchQueueReaderInner` ([§3.4](#34-resource-group-registry)), not a separately shared handle. The reader's `Arc` is the one sharing mechanism the group's queue has, and the writer reaches the counter through the reader clone it holds — which is why a hint and the counter it accounts for can never name different groups.
+
+The core is this queue's only writer, and a closed broadcast queue is fatal to it: the read side is gone, no general execution manager will ever see a hint again, and there is no second channel through which general capacity could be steered. The reader side is the opposite case — a hint whose group was cleared by a session bump leads to a closed queue, which is simply the end of that session's work and yields no assignment. Closure is a failure on the side that publishes and an ordinary end of session on the side that consumes ([§8.3](#83-other-invariants)).
 
 The queue must be unbounded because those peaks are not simultaneous: their sum can exceed `dispatch_queue_capacity`, and a rejected hint send would break the coverage invariant with no way to detect or repair it.
 
@@ -294,21 +296,24 @@ loop {
             last_served_rg = Some(unit.rg_id);
             arm = (arm + 1) % rg_rr_list.len();
         }
-        Err(_) => {
+        Err(NoTask | DispatchQueueFull) => {
             rg_rr_list.swap_remove(arm);
             if arm == rg_rr_list.len() { arm = 0 }
             // arm is NOT incremented: swap_remove moved the tail element into
             // this slot, and incrementing would skip it.
         }
+        Err(closed) => return Err(closed),
     }
 }
 ```
+
+Only `NoTask` and `DispatchQueueFull` end a group's turn. Both say the group has nothing more to give *this tick* — it ran out of schedulable work, or it reached the admission threshold — and the rotation continues over the groups that remain. `DispatchQueueClosed` and `BroadcastQueueClosed` say something else entirely: a queue the core writes into has lost its far end. There is no group to drop and no tick to finish, so the error leaves the loop, leaves the tick, and stops the core ([§8.3](#83-other-invariants)).
 
 **e. Apply buffered state.** Process the downgrade buffer ([§5.5](#55-promotion-downgrade-and-retirement)), then for every unit that reported `NoTask`, deactivate it if and only if it has **no schedulable tasks and an empty dispatch queue** — clear `is_active` and swap-remove it from `active_rg_list`.
 
 The empty-queue condition is required for correctness, not tidiness: `F` is computed over `active_rg_list` only, so a deactivated group still holding assignments would make its occupancy invisible and let the core over-admit. The cost is one wasted visit per tick until such a group's queue drains.
 
-Note the two removals are distinct. Removal from `rg_rr_list` means "nothing more from this group this tick" and is triggered by any `Err`. Deactivation is persistent and is decided only here.
+Note the two removals are distinct. Removal from `rg_rr_list` means "nothing more from this group this tick" and is triggered by `NoTask` or `DispatchQueueFull`, the only two errors that end a group's turn rather than the tick. Deactivation is persistent and is decided only here.
 
 #### `try_make_assignment`
 
@@ -323,8 +328,10 @@ That is why it is a method on the unit and not on the core. `self.rg_units[i].tr
    - Resolve the key of the active job at `rr_arm`. If it does not resolve, the job has been removed — swap it out for the next key in `pending_jobs` that does resolve.
    - Call `get_next_task()` on the resolved entry. If it yields nothing, decrement that job's `downgrade_counter`; if the counter reaches zero, buffer the job for downgrade and swap in the next pending job, otherwise advance `rr_arm` to the next active job.
 5. Publish the resulting assignment through the unit's writer, **in this order**:
-   - `writer.try_send(assignment)` — into the group's own queue first, so a pinned execution manager can take it immediately;
-   - then compare `writer.living_hint()` `H` against `writer.queue_len()` `S`. If `H >= S`, done. Otherwise `writer.increment_living_hint()` and send `writer.hint()` — a reader clone — to the broadcast queue. Should that send ever fail, `writer.decrement_living_hint()` rolls the count back; the queue is unbounded, so it cannot fail for want of capacity ([§8.2](#82-requirements-the-proof-depends-on)), and the rollback exists so that a failure which is not supposed to happen cannot leave `H` overstating coverage.
+   - `writer.try_send(assignment)` — into the group's own queue first, so a pinned execution manager can take it immediately. The queue is unbounded, so the send fails only if the channel is closed, which returns `Err(DispatchQueueClosed)`;
+   - then compare `writer.living_hint()` `H` against `writer.queue_len()` `S`. If `H >= S`, done. Otherwise `writer.increment_living_hint()` and send `writer.hint()` — a reader clone — to the broadcast queue. That queue is unbounded too, so this send likewise fails only on closure, which returns `Err(BroadcastQueueClosed)`.
+
+   Neither failure is rolled back. The increment is not undone and the published assignment is not withdrawn, because a closed queue on the write side stops the core ([§8.3](#83-other-invariants)): there is no next tick that could read an overstated `H`, and nothing left to repair for. Rollback would only be worth writing if the core intended to keep scheduling afterwards, and it does not.
 
 The ordering in step 5 is normative; reversing it lets a general execution manager consume a hint for an assignment that is not yet visible. See [§8](#8-invariants).
 
@@ -404,7 +411,7 @@ The rotation in [§5.4](#54-step-4--dispatch-queue-filling) satisfies both.
 
 ### 7.1 Pinned execution manager
 
-The service looks up the group in `rg_table`, creating it if absent, and clones the `RgDispatchQueueReader`. It then blocks on `recv_pinned` until an assignment arrives or the request's wait time expires.
+The service looks up the group in `rg_table`, creating it if absent, and clones the `RgDispatchQueueReader`. It then blocks on `recv_pinned` until an assignment arrives, the request's wait time expires, or the queue closes under a session bump. The last of those is not an error: `recv_pinned` returns no assignment, exactly as it does on a timeout ([§8.3](#83-other-invariants)).
 
 The reader is re-fetched per request, so a session bump that replaces `rg_table` is picked up on the next call.
 
@@ -413,6 +420,8 @@ The reader is re-fetched per request, so a session bump that replaces `rg_table`
 The service blocks on the broadcast queue. On receiving an `RgDispatchQueueReader` it calls `consume_hint_and_try_recv`, which decrements `living_hint` — **immediately, with no await point between the receive and the decrement** — and then attempts one `try_recv` on the group's queue. On success the assignment is returned. On empty the hint was stale: the service moves on to the next hint.
 
 The decrement and the pop attempt are one method rather than two steps at the call site because that is the only counter access the read side has ([§3.4](#34-resource-group-registry)); a caller cannot decrement twice, decrement without attempting, or await in between.
+
+A closed channel is an expected outcome on this path, not a failure. A session bump clears `rg_table` and the scheduling units together, dropping every sender a group's queue had ([§9](#9-session-bump)); a general execution manager blocked on the broadcast queue, or holding a hint whose group has since been cleared, therefore finds the channel closed rather than empty. The two are the same answer here — no assignment is coming — and both reader methods return an `Option` that collapses them, so the service falls through to its retry exactly as it does for an empty queue. This is the read half of the rule in [§8.3](#83-other-invariants): the side that publishes treats closure as fatal, the side that consumes treats it as the end of a session's queue.
 
 No republication is required. The core's per-admission check alone maintains coverage.
 
@@ -480,6 +489,12 @@ This invariant no longer has a runtime safety net, and no longer needs one. It u
 
 No path in the design needs two job entries mutably at once. One that did would use `SlotMap::get_disjoint_mut`, which takes the keys together and returns `None` if they alias; it would not reach for a second borrow of the arena.
 
+**Channel closure.** A closed channel is fatal on the write side and expected on the read side, and the two cases are read differently everywhere in this design.
+
+The core is the sole writer of every group's dispatch queue and of the broadcast queue. A closed channel there means the far end no longer exists — nobody will ever take that group's assignments, or no general execution manager will ever see another hint — and neither is something a later tick can repair: there is no second queue to publish into and no state to restore. The core therefore returns an error and stops rather than logging and continuing to tick. Dying is an affordable response precisely because no production path closes either channel: while the design's ownership holds, the write side never sees a closure, so the policy costs nothing in the expected case and gives up nothing in the unexpected one, where the alternative is a core that ticks on publishing into a queue nobody reads. This is what removes the rollback from publication ([§5.4](#54-step-4--dispatch-queue-filling)): the only send failure left is one the core does not survive, so there is no surviving `H` for a decrement to correct.
+
+The read side is the mirror image. A group's queue closes only when every sender has been dropped, which is precisely what a session bump does ([§9](#9-session-bump)) — so a reader already blocked in `recv_pinned`, or one following a hint into a group that has since been cleared, is *supposed* to find its channel closed. That is the end of a bumped session's queue, not a fault in it. Both reader methods return an `Option` and give *closed* and *empty* the same answer, `None`: no assignment. Their signatures are chosen for that reason, and not merely because an `Option` was convenient to produce.
+
 ## 9. Session bump
 
 Detected in step 1 from the session ID returned by the inbound-queue gRPC calls, and applied at the end of that step, in this order:
@@ -493,6 +508,10 @@ Detected in step 1 from the session ID returned by the inbound-queue gRPC calls,
 Per-group queues are not drained explicitly; they are dropped with `rg_table`. An execution manager still blocked on an old reader keeps it alive but its assignments fail the session check.
 
 **Step 2 is a correctness requirement, not tidiness.** Clearing `rg_units` is the one event that invalidates positions in it, and `rg_units` is a plain `Vec` precisely because that event is the only one ([§3.4](#34-resource-group-registry)). Indices carry no generation, so a surviving `active_rg_list` entry or `rg_index` value would resolve against the new session's units — either out of bounds, or, once the new session has re-created a few groups, silently against the wrong group. Both index holders must therefore be cleared in the same operation as the `Vec` they index; the type system does not check this, and it is why the three are named together above rather than left to the reader.
+
+**The same operation is a correctness requirement for a second reason.** A group's queue closes only once *every* sender to it is dropped, and there are exactly two: the table entry's, and the one inside the scheduling unit's writer ([§3.4](#34-resource-group-registry)). Dropping both together is what makes the bump observable to the readers still blocked on that queue — they wake to a closed channel and report no assignment, which is the benign half of [§8.3](#83-other-invariants). Clear only the table and the queue does not close at all: the surviving unit keeps publishing into a queue the new session's readers no longer resolve to, since the table hands out a freshly created queue for the same group. Clear only the units and the table serves readers for a queue nothing will fill again.
+
+Under the previous handling either divergence was a leak the core logged and survived. It is not survivable now. The core holds the writer, and a writer that finds its channel closed stops the scheduler rather than reporting a stale group it can skip — so any later change that lets the two clears drift apart, or that closes a group's queue while its unit still lives, converts a leak into the core's death on the next publication. The two clears must stay one operation.
 
 Job keys need no such care. A key held across the bump fails to resolve against the cleared arena, which is the same `None` any stale key produces — the bump is not a special case for them.
 

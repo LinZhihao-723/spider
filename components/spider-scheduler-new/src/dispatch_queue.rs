@@ -80,6 +80,15 @@ impl GlobalDispatchQueue {
     pub(crate) fn drain(&self) {
         while self.receiver.try_recv().is_ok() {}
     }
+
+    /// Closes the hint channel, so that every later publication is rejected.
+    ///
+    /// No production path closes the channel; this exists so that a test can drive the core into
+    /// the failure the closure represents.
+    #[cfg(test)]
+    pub(crate) fn close(&self) {
+        self.sender.close();
+    }
 }
 
 impl Default for GlobalDispatchQueue {

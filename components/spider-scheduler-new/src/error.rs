@@ -19,6 +19,11 @@ pub enum CoreError {
     #[error(transparent)]
     Storage(#[from] StorageClientError),
 
+    /// A queue the core publishes into is closed, so nothing it publishes can ever be taken. No
+    /// later tick can recover from it.
+    #[error("fatal publication failure: {0}")]
+    FatalPublication(MakeAssignmentError),
+
     /// An invariant of the core was violated.
     #[error("internal error: {0}")]
     Internal(String),
@@ -38,6 +43,10 @@ pub enum MakeAssignmentError {
     /// The resource group's dispatch queue is closed and can no longer accept assignments.
     #[error("dispatch queue is closed")]
     DispatchQueueClosed,
+
+    /// The global dispatch queue is closed and can no longer carry hints.
+    #[error("broadcast queue is closed")]
+    BroadcastQueueClosed,
 }
 
 /// Errors returned by the prototype's test harness.

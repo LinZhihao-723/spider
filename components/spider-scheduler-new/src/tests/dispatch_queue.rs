@@ -216,9 +216,6 @@ fn a_hint_spend_against_no_outstanding_hint_clamps_the_count_at_zero() {
     assert_eq!(reader.consume_hint_and_try_recv(), None);
     assert_eq!(writer.living_hint(), 0);
 
-    writer.decrement_living_hint();
-    assert_eq!(writer.living_hint(), 0);
-
     writer.increment_living_hint();
     assert_eq!(writer.living_hint(), 1);
 }

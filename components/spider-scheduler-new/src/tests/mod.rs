@@ -84,6 +84,7 @@ const TICK_DEADLINE: Duration = Duration::from_secs(10);
 struct CoreFixture {
     core: Core<FakeStorage>,
     rg_table: ResourceGroupTable,
+    global_queue: GlobalDispatchQueue,
     session_manager: SessionManager,
     reschedule_queue_writer: UnboundedSender<TaskAssignment>,
     active_job_list_capacity: usize,
@@ -104,7 +105,7 @@ impl CoreFixture {
             config,
             storage,
             rg_table.clone(),
-            global_queue,
+            global_queue.clone(),
             session_manager.clone(),
             reschedule_queue_reader,
             CancellationToken::new(),
@@ -112,6 +113,7 @@ impl CoreFixture {
         Self {
             core,
             rg_table,
+            global_queue,
             session_manager,
             reschedule_queue_writer,
             active_job_list_capacity: config.active_job_list_capacity.get(),
@@ -209,6 +211,19 @@ impl CoreFixture {
     /// test hands to [`drain_reader`] to play a pinned execution manager.
     fn reader(&self, rg_id: ResourceGroupId) -> RgDispatchQueueReader {
         reader_of(&self.rg_table, rg_id, self.session_manager.current())
+    }
+
+    /// Closes `rg_id`'s dispatch queue, so that the core's next publication into it is rejected.
+    fn close_dispatch_queue(&self, rg_id: ResourceGroupId) {
+        self.rg_table
+            .get_or_create(rg_id, self.session_manager.current())
+            .sender
+            .close();
+    }
+
+    /// Closes the hint channel, so that the core's next hint publication is rejected.
+    fn close_broadcast_queue(&self) {
+        self.global_queue.close();
     }
 }
 

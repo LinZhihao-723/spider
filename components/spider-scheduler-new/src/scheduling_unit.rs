@@ -365,6 +365,7 @@ impl RgSchedulingUnit {
     /// Returns an error if:
     ///
     /// * [`MakeAssignmentError::DispatchQueueClosed`] if the group's queue is closed.
+    /// * [`MakeAssignmentError::BroadcastQueueClosed`] if the global dispatch queue is closed.
     fn publish(
         &self,
         job_id: JobId,
@@ -396,14 +397,7 @@ impl RgSchedulingUnit {
 
         self.writer.increment_living_hint();
         if !global_queue.try_send(self.writer.hint()) {
-            // The hint channel is unbounded, so this is unreachable unless it was closed. The
-            // counter must still be restored, or the group would be credited with a pop attempt
-            // nobody will make.
-            self.writer.decrement_living_hint();
-            tracing::error!(
-                rg_id = ? self.rg_id,
-                "Failed to publish a dispatch hint."
-            );
+            return Err(MakeAssignmentError::BroadcastQueueClosed);
         }
         Ok(())
     }

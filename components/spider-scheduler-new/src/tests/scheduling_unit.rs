@@ -161,6 +161,11 @@ impl UnitFixture {
             .sender
             .close();
     }
+
+    /// Closes the global dispatch queue, so that the channel rejects the next hint.
+    fn close_broadcast_queue(&self) {
+        self.global_queue.close();
+    }
 }
 
 #[test]
@@ -376,5 +381,18 @@ fn a_rejected_publication_leaves_the_regular_task_buffered() -> anyhow::Result<(
     );
     assert!(fixture.has_ready_task(job_a));
     assert!(fixture.unit.has_schedulable_task());
+    Ok(())
+}
+
+#[test]
+fn a_closed_broadcast_queue_fails_the_publication() -> anyhow::Result<()> {
+    let mut fixture = UnitFixture::new(1);
+    fixture.add_job(JOB_A, 1)?;
+    fixture.close_broadcast_queue();
+
+    assert_eq!(
+        fixture.try_make(FREE_SPACE),
+        Err(MakeAssignmentError::BroadcastQueueClosed)
+    );
     Ok(())
 }

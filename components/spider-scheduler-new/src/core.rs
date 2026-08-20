@@ -230,6 +230,7 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
     ///
     /// * Forwards [`AsyncInboundQueueReader::try_collect_result`]'s return values on failure.
     /// * Forwards [`Self::start_inbound_poll`]'s return values on failure.
+    /// * Forwards [`Self::fill_dispatch_queues`]'s return values on failure.
     pub(crate) async fn tick(&mut self) -> Result<(), CoreError> {
         let mut timer = TickTimer::start();
         let poll_state = self
@@ -268,7 +269,7 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
             InboundPollState::Pending => timer.finish_step(TickStep::Collect),
         }
 
-        let (jobs_to_retire, assignments_published) = self.fill_dispatch_queues();
+        let (jobs_to_retire, assignments_published) = self.fill_dispatch_queues()?;
         timer.finish_step(TickStep::Fill);
 
         self.retire_jobs(jobs_to_retire);
@@ -291,6 +292,12 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
     /// no generation, so an index that outlives the flush does not fail: it resolves against the
     /// new session's units, either out of bounds or -- once the new session has re-created a few
     /// groups -- silently against the wrong group. Nothing in the type system checks this.
+    ///
+    /// [`Self::rg_table`] must be cleared together with them, and that too is a correctness
+    /// requirement rather than tidiness. A group's queue closes only once every sender has been
+    /// dropped, and a scheduling unit's write side is one of them; a unit that survived the table's
+    /// flush would therefore hold a write side onto a queue whose readers are gone, and publishing
+    /// into a closed queue is fatal to the core.
     fn apply_session_bump(&mut self, new_session_id: SessionId) {
         tracing::info!(
             new_session_id,
@@ -463,15 +470,23 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
     ///
     /// # Returns
     ///
-    /// A tuple containing:
+    /// A tuple on success, containing:
     ///
     /// * The jobs that exhausted their downgrade budget and must be retired.
     /// * The number of assignments published.
-    fn fill_dispatch_queues(&mut self) -> (Vec<JobKey>, u64) {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    ///
+    /// * [`CoreError::FatalPublication`] if a group's dispatch queue or the global dispatch queue
+    ///   is closed, in which case the assignments the core makes can no longer reach an execution
+    ///   manager.
+    fn fill_dispatch_queues(&mut self) -> Result<(Vec<JobKey>, u64), CoreError> {
         let mut jobs_to_retire = Vec::new();
         let mut assignments_published = 0;
         if self.active_rg_list.is_empty() {
-            return (jobs_to_retire, assignments_published);
+            return Ok((jobs_to_retire, assignments_published));
         }
 
         // The decision loop needs the scheduling units and the job arena borrowed mutably at the
@@ -536,8 +551,13 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
                     arm = (arm + 1) % rg_rr_list.len();
                 }
                 Err(err) => {
-                    if MakeAssignmentError::NoTask == err {
-                        exhausted_units.push(unit_index);
+                    match err {
+                        MakeAssignmentError::NoTask => exhausted_units.push(unit_index),
+                        MakeAssignmentError::DispatchQueueFull => (),
+                        MakeAssignmentError::DispatchQueueClosed
+                        | MakeAssignmentError::BroadcastQueueClosed => {
+                            return Err(CoreError::FatalPublication(err));
+                        }
                     }
                     rg_rr_list.swap_remove(arm);
                     // `swap_remove` moved the tail element into this slot, so advancing the arm
@@ -554,7 +574,7 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
         }
         self.deactivate_exhausted_units(exhausted_units);
 
-        (jobs_to_retire, assignments_published)
+        Ok((jobs_to_retire, assignments_published))
     }
 
     /// Takes every exhausted group that also holds no assignment off the active resource group

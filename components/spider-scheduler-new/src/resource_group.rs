@@ -167,6 +167,11 @@ impl RgDispatchQueueReader {
     /// Used by a pinned execution manager, which is steered by nothing but this queue and therefore
     /// leaves the hint counter untouched.
     ///
+    /// A closed queue is deliberately collapsed into the empty case rather than surfaced as an
+    /// error: a session bump clears the resource group table, so a caller already blocked here
+    /// wakes to find the queue closed, and the only thing that can mean is that the session it
+    /// waited for is over. Closure is fatal only on the write side.
+    ///
     /// # Returns
     ///
     /// The next assignment, or [`None`] if none arrived before `wait_time` expired or the queue was
@@ -183,6 +188,10 @@ impl RgDispatchQueueReader {
     /// The caller must hold exactly one outstanding hint for this group. A decrement against no
     /// hint clamps at zero, and neither over- nor under-counting is detectable afterward.
     ///
+    /// A closed queue is deliberately collapsed into the empty case rather than surfaced as an
+    /// error, for the reason given on [`Self::recv_pinned`]: the hint outlived the session that
+    /// published it, and the caller is simply served nothing.
+    ///
     /// # Cancel safety
     ///
     /// This method is synchronous, so its decrement and its pop cannot be separated by
@@ -193,7 +202,7 @@ impl RgDispatchQueueReader {
     ///
     /// # Returns
     ///
-    /// The next assignment, or [`None`] if the hint was stale and the queue is empty.
+    /// The next assignment, or [`None`] if the hint was stale and the queue is empty or closed.
     pub(crate) fn consume_hint_and_try_recv(&self) -> Option<TaskAssignment> {
         self.inner.decrement_living_hint();
         self.inner.receiver.try_recv().ok()
@@ -265,13 +274,6 @@ impl RgDispatchQueueWriter {
         self.reader.inner.increment_living_hint();
     }
 
-    /// Takes one outstanding hint back off the group, clamping at zero.
-    ///
-    /// Rolls back an increment whose hint never reached the global dispatch queue.
-    pub(crate) fn decrement_living_hint(&self) {
-        self.reader.inner.decrement_living_hint();
-    }
-
     /// # Returns
     ///
     /// A hint for this group, which is what the global dispatch queue carries.
@@ -312,7 +314,7 @@ impl RgDispatchQueueReaderInner {
     fn decrement_living_hint(&self) {
         let _ = self
             .living_hint
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |hint| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |hint| {
                 Some(hint.saturating_sub(1))
             });
     }
