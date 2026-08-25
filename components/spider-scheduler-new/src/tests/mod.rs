@@ -41,23 +41,22 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use anyhow::bail;
+use spider_core::session::SessionTracker;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::CoreConfig;
 use crate::core::Core;
-use crate::dispatch_queue::GlobalDispatchQueue;
+use crate::dispatch_queue::DispatchQueueRegistry;
+use crate::dispatch_queue::RgDispatchQueueReader;
+use crate::dispatch_queue::RgDispatchQueueWriter;
 use crate::harness::FakeStorage;
 use crate::harness::FakeStorageConfig;
 use crate::job_registry::JobKey;
 use crate::job_registry::JobRegistry;
 use crate::job_registry::UpsertOutcome;
-use crate::resource_group::ResourceGroupTable;
-use crate::resource_group::RgDispatchQueueReader;
-use crate::resource_group::RgDispatchQueueWriter;
 use crate::scheduling_unit::RgSchedulingUnit;
-use crate::session::SessionManager;
 use crate::types::JobId;
 use crate::types::ResourceGroupId;
 use crate::types::SessionId;
@@ -83,9 +82,8 @@ const TICK_DEADLINE: Duration = Duration::from_secs(10);
 /// manual [`Core::tick`] calls.
 struct CoreFixture {
     core: Core<FakeStorage>,
-    rg_table: ResourceGroupTable,
-    global_queue: GlobalDispatchQueue,
-    session_manager: SessionManager,
+    dispatch_queue_registry: DispatchQueueRegistry,
+    session_tracker: SessionTracker,
     reschedule_queue_writer: UnboundedSender<TaskAssignment>,
     active_job_list_capacity: usize,
 }
@@ -97,24 +95,21 @@ impl CoreFixture {
     ///
     /// A newly created fixture whose core holds no buffered task and no active resource group.
     fn new(config: CoreConfig, storage: FakeStorage) -> Self {
-        let rg_table = ResourceGroupTable::new();
-        let global_queue = GlobalDispatchQueue::new();
-        let session_manager = SessionManager::new(DEFAULT_SESSION_ID);
+        let session_tracker = SessionTracker::new(DEFAULT_SESSION_ID);
+        let dispatch_queue_registry = DispatchQueueRegistry::new(session_tracker.clone());
         let (reschedule_queue_writer, reschedule_queue_reader) = unbounded_channel();
         let core = Core::new(
             config,
             storage,
-            rg_table.clone(),
-            global_queue.clone(),
-            session_manager.clone(),
+            dispatch_queue_registry.clone(),
+            session_tracker.clone(),
             reschedule_queue_reader,
             CancellationToken::new(),
         );
         Self {
             core,
-            rg_table,
-            global_queue,
-            session_manager,
+            dispatch_queue_registry,
+            session_tracker,
             reschedule_queue_writer,
             active_job_list_capacity: config.active_job_list_capacity.get(),
         }
@@ -132,9 +127,8 @@ impl CoreFixture {
         }
 
         let mut unit = make_unit(
-            &self.rg_table,
+            &self.dispatch_queue_registry,
             rg_id,
-            self.session_manager.current(),
             self.active_job_list_capacity,
         );
         unit.is_active = true;
@@ -179,17 +173,17 @@ impl CoreFixture {
     ///
     /// * [`anyhow::Error`] if the group's dispatch queue rejects an assignment.
     fn preload_queue(&self, rg_id: ResourceGroupId, num_assignments: usize) -> anyhow::Result<()> {
-        let endpoints = self
-            .rg_table
-            .get_or_create(rg_id, self.session_manager.current());
         for index in 0..num_assignments {
             let assignment = make_assignment(
                 rg_id,
                 JobId::from(u64::MAX),
                 TaskId::Index(index),
-                self.session_manager.current(),
+                self.session_tracker.current(),
             );
-            if endpoints.sender.try_send(assignment).is_err() {
+            if !self
+                .dispatch_queue_registry
+                .preload_queue(rg_id, assignment)
+            {
                 bail!(
                     "the dispatch queue of resource group {rg_id} rejected a preloaded assignment"
                 );
@@ -202,7 +196,7 @@ impl CoreFixture {
     ///
     /// The number of assignments currently queued for `rg_id`.
     fn queue_len(&self, rg_id: ResourceGroupId) -> usize {
-        writer_of(&self.rg_table, rg_id, self.session_manager.current()).queue_len()
+        writer_of(&self.dispatch_queue_registry, rg_id).queue_len()
     }
 
     /// # Returns
@@ -210,20 +204,17 @@ impl CoreFixture {
     /// The read side of `rg_id`'s dispatch queue in the session the core currently serves, which a
     /// test hands to [`drain_reader`] to play a pinned execution manager.
     fn reader(&self, rg_id: ResourceGroupId) -> RgDispatchQueueReader {
-        reader_of(&self.rg_table, rg_id, self.session_manager.current())
+        reader_of(&self.dispatch_queue_registry, rg_id)
     }
 
     /// Closes `rg_id`'s dispatch queue, so that the core's next publication into it is rejected.
     fn close_dispatch_queue(&self, rg_id: ResourceGroupId) {
-        self.rg_table
-            .get_or_create(rg_id, self.session_manager.current())
-            .sender
-            .close();
+        self.dispatch_queue_registry.close_dispatch_queue(rg_id);
     }
 
-    /// Closes the hint channel, so that the core's next hint publication is rejected.
+    /// Closes the broadcast queue, so that the core's next hint publication is rejected.
     fn close_broadcast_queue(&self) {
-        self.global_queue.close();
+        self.dispatch_queue_registry.close_broadcast_queue();
     }
 }
 
@@ -271,14 +262,13 @@ fn make_idle_storage() -> FakeStorage {
 ///
 /// A newly created, inactive scheduling unit publishing into `rg_id`'s dispatch queue.
 fn make_unit(
-    rg_table: &ResourceGroupTable,
+    dispatch_queue_registry: &DispatchQueueRegistry,
     rg_id: ResourceGroupId,
-    session_id: SessionId,
     active_job_list_capacity: usize,
 ) -> RgSchedulingUnit {
     RgSchedulingUnit::new(
         rg_id,
-        &rg_table.get_or_create(rg_id, session_id),
+        dispatch_queue_registry.get_dispatch_queue_writer(rg_id),
         active_job_list_capacity,
     )
 }
@@ -326,26 +316,24 @@ fn make_assignment(
 
 /// # Returns
 ///
-/// The read side of `rg_id`'s dispatch queue, creating the group in `session_id` if the table has
-/// no entry for it.
+/// The read side of `rg_id`'s dispatch queue, creating the group if the registry has no entry for
+/// it.
 fn reader_of(
-    rg_table: &ResourceGroupTable,
+    dispatch_queue_registry: &DispatchQueueRegistry,
     rg_id: ResourceGroupId,
-    session_id: SessionId,
 ) -> RgDispatchQueueReader {
-    rg_table.get_dispatch_queue_reader(rg_id, session_id)
+    dispatch_queue_registry.get_dispatch_queue_reader(rg_id)
 }
 
 /// # Returns
 ///
-/// The write side of `rg_id`'s dispatch queue, creating the group in `session_id` if the table has
-/// no entry for it.
+/// The write side of `rg_id`'s dispatch queue, creating the group if the registry has no entry for
+/// it.
 fn writer_of(
-    rg_table: &ResourceGroupTable,
+    dispatch_queue_registry: &DispatchQueueRegistry,
     rg_id: ResourceGroupId,
-    session_id: SessionId,
 ) -> RgDispatchQueueWriter {
-    rg_table.get_or_create(rg_id, session_id).writer()
+    dispatch_queue_registry.get_dispatch_queue_writer(rg_id)
 }
 
 /// Takes every assignment currently queued behind `reader`, playing a pinned execution manager,

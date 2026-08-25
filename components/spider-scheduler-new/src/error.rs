@@ -40,13 +40,14 @@ pub enum MakeAssignmentError {
     #[error("dispatch queue is full")]
     DispatchQueueFull,
 
-    /// The resource group's dispatch queue is closed and can no longer accept assignments.
+    /// A queue the write side publishes into is closed: either the resource group's own dispatch
+    /// queue, which can no longer accept assignments, or the broadcast queue, which can no longer
+    /// carry hints to general execution managers. The two are indistinguishable to every caller --
+    /// both are fatal, both stop the core, and neither leaves anything to recover -- and a closed
+    /// broadcast queue is moreover unreachable while the registry lives, since the registry holds
+    /// both of that queue's ends.
     #[error("dispatch queue is closed")]
     DispatchQueueClosed,
-
-    /// The global dispatch queue is closed and can no longer carry hints.
-    #[error("broadcast queue is closed")]
-    BroadcastQueueClosed,
 }
 
 /// Errors returned by the prototype's test harness.

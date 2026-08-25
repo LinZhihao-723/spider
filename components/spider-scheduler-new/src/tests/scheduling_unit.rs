@@ -1,16 +1,17 @@
 //! Unit tests for a resource group's scheduling unit: what it picks, when it refuses, and how a
 //! job moves between the active list, the pending queue, and retirement.
 
+use spider_core::session::SessionTracker;
+
 use super::DEFAULT_SESSION_ID;
 use super::make_job_entry;
 use super::make_unit;
 use crate::core::TaskAssignmentIdIssuer;
-use crate::dispatch_queue::GlobalDispatchQueue;
+use crate::dispatch_queue::DispatchQueueRegistry;
 use crate::error::MakeAssignmentError;
 use crate::job_registry::DOWNGRADE_LIVES;
 use crate::job_registry::JobKey;
 use crate::job_registry::JobRegistry;
-use crate::resource_group::ResourceGroupTable;
 use crate::scheduling_unit::RgSchedulingUnit;
 use crate::types::FinalizeKind;
 use crate::types::JobId;
@@ -38,9 +39,8 @@ struct UnitFixture {
     unit: RgSchedulingUnit,
     registry: JobRegistry,
     jobs_to_retire: Vec<JobKey>,
-    global_queue: GlobalDispatchQueue,
     id_issuer: TaskAssignmentIdIssuer,
-    rg_table: ResourceGroupTable,
+    dispatch_queue_registry: DispatchQueueRegistry,
 }
 
 impl UnitFixture {
@@ -50,19 +50,14 @@ impl UnitFixture {
     ///
     /// A newly created fixture whose unit holds no job.
     fn new(active_job_list_capacity: usize) -> Self {
-        let rg_table = ResourceGroupTable::new();
+        let dispatch_queue_registry =
+            DispatchQueueRegistry::new(SessionTracker::new(DEFAULT_SESSION_ID));
         Self {
-            unit: make_unit(
-                &rg_table,
-                RG_ID,
-                DEFAULT_SESSION_ID,
-                active_job_list_capacity,
-            ),
+            unit: make_unit(&dispatch_queue_registry, RG_ID, active_job_list_capacity),
             registry: JobRegistry::new(),
             jobs_to_retire: Vec::new(),
-            global_queue: GlobalDispatchQueue::new(),
             id_issuer: TaskAssignmentIdIssuer::new(),
-            rg_table,
+            dispatch_queue_registry,
         }
     }
 
@@ -100,7 +95,6 @@ impl UnitFixture {
             unit,
             registry,
             jobs_to_retire,
-            global_queue,
             id_issuer,
             ..
         } = self;
@@ -108,7 +102,6 @@ impl UnitFixture {
             free,
             DEFAULT_SESSION_ID,
             id_issuer,
-            global_queue,
             registry,
             jobs_to_retire,
         )
@@ -154,17 +147,23 @@ impl UnitFixture {
             .has_ready_task()
     }
 
-    /// Closes the group's dispatch queue, so that the channel rejects the next publication.
-    fn close_dispatch_queue(&self) {
-        self.rg_table
-            .get_or_create(RG_ID, DEFAULT_SESSION_ID)
-            .sender
-            .close();
+    /// # Returns
+    ///
+    /// The number of assignments currently queued for the group.
+    fn queue_len(&self) -> usize {
+        self.dispatch_queue_registry
+            .get_dispatch_queue_writer(RG_ID)
+            .queue_len()
     }
 
-    /// Closes the global dispatch queue, so that the channel rejects the next hint.
+    /// Closes the group's dispatch queue, so that the channel rejects the next publication.
+    fn close_dispatch_queue(&self) {
+        self.dispatch_queue_registry.close_dispatch_queue(RG_ID);
+    }
+
+    /// Closes the broadcast queue, so that it rejects the next hint.
     fn close_broadcast_queue(&self) {
-        self.global_queue.close();
+        self.dispatch_queue_registry.close_broadcast_queue();
     }
 }
 
@@ -392,7 +391,12 @@ fn a_closed_broadcast_queue_fails_the_publication() -> anyhow::Result<()> {
 
     assert_eq!(
         fixture.try_make(FREE_SPACE),
-        Err(MakeAssignmentError::BroadcastQueueClosed)
+        Err(MakeAssignmentError::DispatchQueueClosed)
     );
+
+    // Both closures report the same error, so the queue is what tells them apart: this publication
+    // reached the group's queue first and lost only the hint covering it.
+    assert_eq!(fixture.queue_len(), 1);
+    assert_eq!(fixture.dispatch_queue_registry.num_outstanding_hints(), 0);
     Ok(())
 }

@@ -16,6 +16,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use spider_core::session::SessionTracker;
 use tokio::select;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_util::sync::CancellationToken;
@@ -24,16 +25,14 @@ use crate::bench::results::TickSample;
 use crate::bench::results::TickStep;
 use crate::bench::results::TickTimer;
 use crate::config::CoreConfig;
-use crate::dispatch_queue::GlobalDispatchQueue;
+use crate::dispatch_queue::DispatchQueueRegistry;
 use crate::error::CoreError;
 use crate::error::MakeAssignmentError;
 use crate::error::StorageClientError;
 use crate::job_registry::JobKey;
 use crate::job_registry::JobRegistry;
 use crate::job_registry::UpsertOutcome;
-use crate::resource_group::ResourceGroupTable;
 use crate::scheduling_unit::RgSchedulingUnit;
-use crate::session::SessionManager;
 use crate::storage_client::SchedulerStorageClient;
 use crate::types::FinalizeKind;
 use crate::types::InboundEntry;
@@ -92,9 +91,8 @@ pub struct Core<StorageClientType: SchedulerStorageClient> {
     pub(crate) last_served_rg: Option<ResourceGroupId>,
 
     config: CoreConfig,
-    rg_table: ResourceGroupTable,
-    global_queue: GlobalDispatchQueue,
-    session_manager: SessionManager,
+    dispatch_queue_registry: DispatchQueueRegistry,
+    session_tracker: SessionTracker,
     id_issuer: TaskAssignmentIdIssuer,
     inbound_queue_reader: AsyncInboundQueueReader<StorageClientType>,
     reschedule_queue_reader: UnboundedReceiver<TaskAssignment>,
@@ -112,9 +110,8 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
     pub fn new(
         config: CoreConfig,
         storage_client: StorageClientType,
-        rg_table: ResourceGroupTable,
-        global_queue: GlobalDispatchQueue,
-        session_manager: SessionManager,
+        dispatch_queue_registry: DispatchQueueRegistry,
+        session_tracker: SessionTracker,
         reschedule_queue_reader: UnboundedReceiver<TaskAssignment>,
         cancellation_token: CancellationToken,
     ) -> Self {
@@ -127,9 +124,8 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
             active_rg_list: Vec::new(),
             last_served_rg: None,
             config,
-            rg_table,
-            global_queue,
-            session_manager,
+            dispatch_queue_registry,
+            session_tracker,
             id_issuer: TaskAssignmentIdIssuer::new(),
             inbound_queue_reader: AsyncInboundQueueReader::new(storage_client),
             reschedule_queue_reader,
@@ -178,7 +174,7 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
     pub async fn run(mut self) -> Result<Vec<TickSample>, CoreError> {
         tracing::info!(
             config = ? self.config,
-            init_session_id = self.session_manager.current(),
+            init_session_id = self.session_tracker.current(),
             "Prototype scheduler core started."
         );
         let tick_interval = Duration::from_millis(self.config.tick_interval_ms.get());
@@ -235,7 +231,7 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
         let mut timer = TickTimer::start();
         let poll_state = self
             .inbound_queue_reader
-            .try_collect_result(self.session_manager.current())
+            .try_collect_result(self.session_tracker.current())
             .await?;
         match poll_state {
             InboundPollState::Ready {
@@ -244,7 +240,7 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
                 commit_ready_entries,
                 cleanup_ready_entries,
             } => {
-                if session_id != self.session_manager.current() {
+                if session_id != self.session_tracker.current() {
                     self.apply_session_bump(session_id);
                 }
                 let rescheduled_entries = self.drain_reschedule_queue(session_id);
@@ -293,22 +289,33 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
     /// new session's units, either out of bounds or -- once the new session has re-created a few
     /// groups -- silently against the wrong group. Nothing in the type system checks this.
     ///
-    /// [`Self::rg_table`] must be cleared together with them, and that too is a correctness
-    /// requirement rather than tidiness. A group's queue closes only once every sender has been
-    /// dropped, and a scheduling unit's write side is one of them; a unit that survived the table's
-    /// flush would therefore hold a write side onto a queue whose readers are gone, and publishing
-    /// into a closed queue is fatal to the core.
+    /// [`Self::dispatch_queue_registry`] must be cleared together with them, and that too is a
+    /// correctness requirement rather than tidiness. A group's queue closes only once every sender
+    /// has been dropped, and a scheduling unit's write side is one of them; a unit that survived
+    /// the registry's flush would therefore hold a write side onto a queue whose readers are gone,
+    /// and publishing into a closed queue is fatal to the core. Clearing the registry is also what
+    /// discards the hints published in the session being left behind.
     fn apply_session_bump(&mut self, new_session_id: SessionId) {
-        tracing::info!(
-            new_session_id,
-            num_resource_groups = self.rg_table.len(),
-            num_jobs = self.job_registry.len(),
-            num_outstanding_hints = self.global_queue.len(),
-            "Storage session bumped. Flushing the core."
-        );
+        let previous_session_id = self.session_tracker.current();
+        if self.session_tracker.try_advance(new_session_id) {
+            tracing::info!(
+                from = previous_session_id,
+                to = new_session_id,
+                num_resource_groups = self.dispatch_queue_registry.len(),
+                num_jobs = self.job_registry.len(),
+                num_outstanding_hints = self.dispatch_queue_registry.num_outstanding_hints(),
+                "Storage session bumped. Flushing the core."
+            );
+        } else {
+            tracing::error!(
+                from = previous_session_id,
+                to = new_session_id,
+                "Storage reported a session no newer than the tracked one. Flushing the core \
+                 anyway, but it keeps serving the tracked session."
+            );
+        }
 
-        self.session_manager.bump(new_session_id);
-        self.rg_table.clear();
+        self.dispatch_queue_registry.clear();
         self.rg_units.clear();
         self.rg_index.clear();
         self.active_rg_list.clear();
@@ -316,7 +323,6 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
         self.job_registry.clear();
         self.global_task_set.clear();
         self.finalized_jobs.clear();
-        self.global_queue.drain();
     }
 
     /// Drains the reschedule queue, dropping assignments published in a session other than
@@ -446,19 +452,19 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
     /// # Returns
     ///
     /// The position of `rg_id`'s scheduling unit in [`Self::rg_units`], appending a unit built
-    /// against the group's dispatch queue endpoints if the core has none.
+    /// against the write side of the group's dispatch queue if the core has none.
     fn get_or_create_unit(&mut self, rg_id: ResourceGroupId) -> usize {
         if let Some(unit_index) = self.rg_index.get(&rg_id) {
             return *unit_index;
         }
 
-        let endpoints = self
-            .rg_table
-            .get_or_create(rg_id, self.session_manager.current());
+        let writer = self
+            .dispatch_queue_registry
+            .get_dispatch_queue_writer(rg_id);
         let unit_index = self.rg_units.len();
         self.rg_units.push(RgSchedulingUnit::new(
             rg_id,
-            &endpoints,
+            writer,
             self.config.active_job_list_capacity.get(),
         ));
         self.rg_index.insert(rg_id, unit_index);
@@ -479,8 +485,8 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
     ///
     /// Returns an error if:
     ///
-    /// * [`CoreError::FatalPublication`] if a group's dispatch queue or the global dispatch queue
-    ///   is closed, in which case the assignments the core makes can no longer reach an execution
+    /// * [`CoreError::FatalPublication`] if a group's dispatch queue or the broadcast queue is
+    ///   closed, in which case the assignments the core makes can no longer reach an execution
     ///   manager.
     fn fill_dispatch_queues(&mut self) -> Result<(Vec<JobKey>, u64), CoreError> {
         let mut jobs_to_retire = Vec::new();
@@ -498,8 +504,7 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
             active_rg_list,
             last_served_rg,
             config,
-            global_queue,
-            session_manager,
+            session_tracker,
             id_issuer,
             ..
         } = self;
@@ -529,7 +534,7 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
             rg_units[*unit_index].promote_pending_jobs(job_registry, &mut jobs_to_retire);
         }
 
-        let session_id = session_manager.current();
+        let session_id = session_tracker.current();
         let mut exhausted_units = Vec::new();
         while 0 != free && !rg_rr_list.is_empty() {
             let unit_index = rg_rr_list[arm];
@@ -538,7 +543,6 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
                 free,
                 session_id,
                 id_issuer,
-                global_queue,
                 job_registry,
                 &mut jobs_to_retire,
             );
@@ -554,8 +558,7 @@ impl<StorageClientType: SchedulerStorageClient> Core<StorageClientType> {
                     match err {
                         MakeAssignmentError::NoTask => exhausted_units.push(unit_index),
                         MakeAssignmentError::DispatchQueueFull => (),
-                        MakeAssignmentError::DispatchQueueClosed
-                        | MakeAssignmentError::BroadcastQueueClosed => {
+                        MakeAssignmentError::DispatchQueueClosed => {
                             return Err(CoreError::FatalPublication(err));
                         }
                     }

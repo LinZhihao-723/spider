@@ -208,7 +208,7 @@ async fn a_session_bump_clears_the_dedup_set_and_the_finalized_job_table() -> an
     let new_session_id = storage.bump_session();
     tick_until!(
         fixture.core,
-        fixture.session_manager.current() == new_session_id
+        fixture.session_tracker.current() == new_session_id
     );
 
     assert!(
@@ -296,7 +296,7 @@ async fn a_rescheduled_assignment_is_readmitted() -> anyhow::Result<()> {
         RG_A,
         JobId::from(0),
         LOST_TASK_ID,
-        fixture.session_manager.current(),
+        fixture.session_tracker.current(),
     );
     fixture.reschedule_queue_writer.send(lost)?;
 
@@ -359,7 +359,11 @@ async fn a_closed_broadcast_queue_fails_the_tick() -> anyhow::Result<()> {
     else {
         bail!("the tick failed with something other than a fatal publication failure");
     };
-    assert_eq!(err, MakeAssignmentError::BroadcastQueueClosed);
+    assert_eq!(err, MakeAssignmentError::DispatchQueueClosed);
+
+    // Both closures fail the tick with the same error, so the queue is what tells them apart: this
+    // assignment reached the group's queue first and lost only the hint covering it.
+    assert_eq!(fixture.queue_len(RG_A), 1);
     Ok(())
 }
 

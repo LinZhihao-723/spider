@@ -1,7 +1,9 @@
-//! Unit tests for the hint channel and the two paths an execution manager pulls assignments
+//! Unit tests for the broadcast queue and the two paths an execution manager pulls assignments
 //! through.
 
 use std::time::Duration;
+
+use spider_core::session::SessionTracker;
 
 use super::DEFAULT_SESSION_ID;
 use super::drain_reader;
@@ -12,12 +14,10 @@ use super::reader_of;
 use super::writer_of;
 use crate::core::TaskAssignmentIdIssuer;
 use crate::dispatch_queue::DispatchOutcome;
+use crate::dispatch_queue::DispatchQueueRegistry;
 use crate::dispatch_queue::DispatchService;
-use crate::dispatch_queue::GlobalDispatchQueue;
 use crate::job_registry::JobRegistry;
-use crate::resource_group::ResourceGroupTable;
 use crate::scheduling_unit::RgSchedulingUnit;
-use crate::session::SessionManager;
 use crate::types::JobId;
 use crate::types::ResourceGroupId;
 use crate::types::SessionId;
@@ -46,9 +46,8 @@ const PUBLISH_DELAY: Duration = Duration::from_millis(5);
 /// One resource group's publishing side, wired to the structures a test inspects.
 struct PublisherFixture {
     unit: RgSchedulingUnit,
-    registry: JobRegistry,
-    rg_table: ResourceGroupTable,
-    global_queue: GlobalDispatchQueue,
+    job_registry: JobRegistry,
+    dispatch_queue_registry: DispatchQueueRegistry,
     id_issuer: TaskAssignmentIdIssuer,
 }
 
@@ -65,15 +64,15 @@ impl PublisherFixture {
     ///
     /// * Forwards [`make_job_entry`]'s return values on failure.
     fn new(num_tasks: usize) -> anyhow::Result<Self> {
-        let rg_table = ResourceGroupTable::new();
-        let mut unit = make_unit(&rg_table, RG_ID, DEFAULT_SESSION_ID, 1);
-        let mut registry = JobRegistry::new();
-        unit.place_new_job(make_job_entry(&mut registry, JOB_ID, num_tasks)?);
+        let dispatch_queue_registry =
+            DispatchQueueRegistry::new(SessionTracker::new(DEFAULT_SESSION_ID));
+        let mut unit = make_unit(&dispatch_queue_registry, RG_ID, 1);
+        let mut job_registry = JobRegistry::new();
+        unit.place_new_job(make_job_entry(&mut job_registry, JOB_ID, num_tasks)?);
         Ok(Self {
             unit,
-            registry,
-            rg_table,
-            global_queue: GlobalDispatchQueue::new(),
+            job_registry,
+            dispatch_queue_registry,
             id_issuer: TaskAssignmentIdIssuer::new(),
         })
     }
@@ -91,8 +90,7 @@ impl PublisherFixture {
             FREE_SPACE,
             DEFAULT_SESSION_ID,
             &self.id_issuer,
-            &self.global_queue,
-            &mut self.registry,
+            &mut self.job_registry,
             &mut jobs_to_retire,
         )?;
         Ok(())
@@ -100,16 +98,16 @@ impl PublisherFixture {
 
     /// # Returns
     ///
-    /// The group's outstanding hint count.
-    fn living_hint(&self) -> usize {
-        writer_of(&self.rg_table, RG_ID, DEFAULT_SESSION_ID).living_hint()
+    /// The number of assignments currently queued for the group.
+    fn queue_len(&self) -> usize {
+        writer_of(&self.dispatch_queue_registry, RG_ID).queue_len()
     }
 
     /// # Returns
     ///
-    /// The number of assignments currently queued for the group.
-    fn queue_len(&self) -> usize {
-        writer_of(&self.rg_table, RG_ID, DEFAULT_SESSION_ID).queue_len()
+    /// The number of hints waiting in the broadcast queue.
+    fn num_outstanding_hints(&self) -> usize {
+        self.dispatch_queue_registry.num_outstanding_hints()
     }
 }
 
@@ -120,46 +118,61 @@ async fn a_hint_is_published_only_while_the_hint_count_trails_the_queue_size() -
 
     fixture.publish()?;
     assert_eq!(fixture.queue_len(), 1);
-    assert_eq!(fixture.living_hint(), 1);
-    assert_eq!(fixture.global_queue.len(), 1);
+    assert_eq!(fixture.num_outstanding_hints(), 1);
 
     // A pinned pop empties the queue without spending the hint, so the hint now covers an
     // assignment that is no longer there.
-    let reader = reader_of(&fixture.rg_table, RG_ID, DEFAULT_SESSION_ID);
+    let reader = reader_of(&fixture.dispatch_queue_registry, RG_ID);
     assert_eq!(drain_reader(&reader).await.len(), 1);
     assert_eq!(fixture.queue_len(), 0);
-    assert_eq!(fixture.living_hint(), 1);
 
+    // The outstanding hint still covers the refilled queue, so this assignment publishes none of
+    // its own and the broadcast queue stays as long as it was.
     fixture.publish()?;
     assert_eq!(fixture.queue_len(), 1);
-    assert_eq!(fixture.living_hint(), 1);
-    assert_eq!(fixture.global_queue.len(), 1);
+    assert_eq!(fixture.num_outstanding_hints(), 1);
 
-    // With the hint spent, the next assignment needs a hint of its own again.
-    assert!(reader.consume_hint_and_try_recv().is_some());
-    assert_eq!(fixture.living_hint(), 0);
+    // With the hint spent -- along with the assignment it finally found -- the next assignment
+    // needs a hint of its own again.
+    let hint = fixture
+        .dispatch_queue_registry
+        .try_next_hint()
+        .expect("a published hint is receivable");
+    assert!(hint.consume_and_try_recv().is_some());
+    assert_eq!(fixture.queue_len(), 0);
+    assert_eq!(fixture.num_outstanding_hints(), 0);
     fixture.publish()?;
-    assert_eq!(fixture.living_hint(), 1);
-    assert_eq!(fixture.global_queue.len(), 2);
+    assert_eq!(fixture.queue_len(), 1);
+    assert_eq!(fixture.num_outstanding_hints(), 1);
     Ok(())
 }
 
 #[tokio::test]
 async fn a_pinned_pop_leaves_the_hint_count_untouched() -> anyhow::Result<()> {
-    let mut fixture = PublisherFixture::new(4)?;
+    let mut fixture = PublisherFixture::new(6)?;
     fixture.publish()?;
     fixture.publish()?;
     assert_eq!(fixture.queue_len(), 2);
-    assert_eq!(fixture.living_hint(), 2);
+    assert_eq!(fixture.num_outstanding_hints(), 2);
 
-    let reader = reader_of(&fixture.rg_table, RG_ID, DEFAULT_SESSION_ID);
+    let reader = reader_of(&fixture.dispatch_queue_registry, RG_ID);
     let assignments = drain_reader(&reader).await;
     assert_eq!(assignments.len(), 2);
     assert_eq!(assignments[0].task_id, TaskId::Index(0));
     assert_eq!(assignments[1].task_id, TaskId::Index(1));
     assert_eq!(fixture.queue_len(), 0);
-    assert_eq!(fixture.living_hint(), 2);
-    assert_eq!(fixture.global_queue.len(), 2);
+    assert_eq!(fixture.num_outstanding_hints(), 2);
+
+    // Both hints survived the pops, and refilling the queue counts them back out: the first two
+    // assignments are still covered, and only the third -- the one that puts the queue ahead of
+    // the count -- publishes a hint.
+    fixture.publish()?;
+    assert_eq!(fixture.num_outstanding_hints(), 2);
+    fixture.publish()?;
+    assert_eq!(fixture.num_outstanding_hints(), 2);
+    fixture.publish()?;
+    assert_eq!(fixture.queue_len(), 3);
+    assert_eq!(fixture.num_outstanding_hints(), 3);
     Ok(())
 }
 
@@ -169,19 +182,25 @@ async fn a_general_pop_consumes_one_hint() -> anyhow::Result<()> {
     fixture.publish()?;
     fixture.publish()?;
 
-    let hinted = fixture
-        .global_queue
-        .recv(DISPATCH_WAIT)
+    let hint = fixture
+        .dispatch_queue_registry
+        .next_hint(DISPATCH_WAIT)
         .await
         .expect("a published hint is receivable");
-    assert_eq!(hinted.rg_id(), RG_ID);
+    assert_eq!(hint.rg_id(), RG_ID);
 
-    let assignment = hinted
-        .consume_hint_and_try_recv()
+    let assignment = hint
+        .consume_and_try_recv()
         .expect("the hinted group holds an assignment");
     assert_eq!(assignment.task_id, TaskId::Index(0));
-    assert_eq!(fixture.living_hint(), 1);
     assert_eq!(fixture.queue_len(), 1);
+
+    // One of the two hints is gone, so the count no longer covers the refilled queue and the next
+    // assignment publishes a hint -- which it would not have done had the pop left the count at
+    // two.
+    fixture.publish()?;
+    assert_eq!(fixture.queue_len(), 2);
+    assert_eq!(fixture.num_outstanding_hints(), 2);
     Ok(())
 }
 
@@ -191,33 +210,42 @@ async fn a_stale_hint_on_an_empty_group_consumes_the_hint_and_yields_nothing() -
     let mut fixture = PublisherFixture::new(4)?;
     fixture.publish()?;
 
-    let reader = reader_of(&fixture.rg_table, RG_ID, DEFAULT_SESSION_ID);
+    let reader = reader_of(&fixture.dispatch_queue_registry, RG_ID);
     assert_eq!(drain_reader(&reader).await.len(), 1);
     assert_eq!(fixture.queue_len(), 0);
-    assert_eq!(fixture.living_hint(), 1);
 
-    let hinted = fixture
-        .global_queue
-        .recv(DISPATCH_WAIT)
+    let hint = fixture
+        .dispatch_queue_registry
+        .next_hint(DISPATCH_WAIT)
         .await
         .expect("a published hint is receivable");
-    assert_eq!(hinted.consume_hint_and_try_recv(), None);
-    assert_eq!(fixture.living_hint(), 0);
+    assert_eq!(hint.consume_and_try_recv(), None);
+    assert_eq!(fixture.num_outstanding_hints(), 0);
+
+    // The stale hint was spent even though it yielded nothing, so the group is uncovered again and
+    // the next assignment publishes a fresh hint.
+    fixture.publish()?;
+    assert_eq!(fixture.num_outstanding_hints(), 1);
     Ok(())
 }
 
-#[test]
-fn a_hint_spend_against_no_outstanding_hint_clamps_the_count_at_zero() {
-    let rg_table = ResourceGroupTable::new();
-    let writer = writer_of(&rg_table, RG_ID, DEFAULT_SESSION_ID);
-    let reader = reader_of(&rg_table, RG_ID, DEFAULT_SESSION_ID);
-    assert_eq!(writer.living_hint(), 0);
+#[tokio::test]
+async fn clearing_the_registry_discards_the_hints_of_the_session_left_behind() -> anyhow::Result<()>
+{
+    let mut fixture = PublisherFixture::new(4)?;
+    fixture.publish()?;
+    fixture.publish()?;
+    assert_eq!(fixture.num_outstanding_hints(), 2);
 
-    assert_eq!(reader.consume_hint_and_try_recv(), None);
-    assert_eq!(writer.living_hint(), 0);
+    fixture.dispatch_queue_registry.clear();
+    assert_eq!(fixture.dispatch_queue_registry.len(), 0);
+    assert_eq!(fixture.num_outstanding_hints(), 0);
 
-    writer.increment_living_hint();
-    assert_eq!(writer.living_hint(), 1);
+    // The queue the discarded hints named is gone with them, so a general execution manager is
+    // steered by nothing the flushed session published.
+    let service = DispatchService::new(fixture.dispatch_queue_registry.clone());
+    assert_eq!(service.next_task_general(DISPATCH_WAIT).await, None);
+    Ok(())
 }
 
 #[tokio::test]
@@ -225,8 +253,8 @@ async fn next_task_pinned_drops_an_assignment_published_in_a_stale_session() -> 
     const STALE_SESSION_ID: SessionId = DEFAULT_SESSION_ID;
     const CURRENT_SESSION_ID: SessionId = DEFAULT_SESSION_ID + 1;
 
-    let (service, rg_table, _global_queue) = make_dispatch_service(CURRENT_SESSION_ID);
-    let writer = writer_of(&rg_table, RG_ID, CURRENT_SESSION_ID);
+    let (service, registry) = make_dispatch_service(SessionTracker::new(CURRENT_SESSION_ID));
+    let writer = writer_of(&registry, RG_ID);
     let assignment = make_assignment(RG_ID, JOB_ID, TaskId::Index(0), STALE_SESSION_ID);
     assert!(writer.try_send(assignment).is_ok());
 
@@ -241,16 +269,20 @@ async fn next_task_general_drops_an_assignment_published_in_a_stale_session() ->
     const STALE_SESSION_ID: SessionId = DEFAULT_SESSION_ID;
     const CURRENT_SESSION_ID: SessionId = DEFAULT_SESSION_ID + 1;
 
-    let (service, rg_table, global_queue) = make_dispatch_service(CURRENT_SESSION_ID);
-    let writer = writer_of(&rg_table, RG_ID, CURRENT_SESSION_ID);
+    let (service, registry) = make_dispatch_service(SessionTracker::new(CURRENT_SESSION_ID));
+    let writer = writer_of(&registry, RG_ID);
     let assignment = make_assignment(RG_ID, JOB_ID, TaskId::Index(0), STALE_SESSION_ID);
     assert!(writer.try_send(assignment).is_ok());
-    writer.increment_living_hint();
-    assert!(global_queue.try_send(writer.hint()));
+    assert_eq!(registry.num_outstanding_hints(), 1);
 
     assert_eq!(service.next_task_general(DISPATCH_WAIT).await, None);
     assert_eq!(writer.queue_len(), 0);
-    assert_eq!(writer.living_hint(), 0);
+
+    // Dropping the assignment spent the hint that led to it, so a fresh assignment makes a hint of
+    // its own again.
+    let fresh = make_assignment(RG_ID, JOB_ID, TaskId::Index(1), CURRENT_SESSION_ID);
+    assert!(writer.try_send(fresh).is_ok());
+    assert_eq!(registry.num_outstanding_hints(), 1);
     Ok(())
 }
 
@@ -260,23 +292,28 @@ async fn next_task_general_discards_a_stale_hint_without_touching_the_hint_count
     const STALE_SESSION_ID: SessionId = DEFAULT_SESSION_ID;
     const CURRENT_SESSION_ID: SessionId = DEFAULT_SESSION_ID + 1;
 
-    let (service, rg_table, global_queue) = make_dispatch_service(CURRENT_SESSION_ID);
-    let writer = writer_of(&rg_table, RG_ID, STALE_SESSION_ID);
+    let session_tracker = SessionTracker::new(STALE_SESSION_ID);
+    let (service, registry) = make_dispatch_service(session_tracker.clone());
+    let writer = writer_of(&registry, RG_ID);
     let assignment = make_assignment(RG_ID, JOB_ID, TaskId::Index(0), STALE_SESSION_ID);
     assert!(writer.try_send(assignment).is_ok());
-    writer.increment_living_hint();
-    assert!(global_queue.try_send(writer.hint()));
 
+    // The group and the hint covering its assignment both belong to the session left behind here.
+    assert!(session_tracker.try_advance(CURRENT_SESSION_ID));
     assert_eq!(service.next_task_general(DISPATCH_WAIT).await, None);
-    assert_eq!(writer.living_hint(), 1);
+
+    // The hint was discarded without a decrement, so it still covers the assignment left in the
+    // queue.
+    assert_eq!(writer.queue_len(), 1);
+    assert_eq!(reader_of(&registry, RG_ID).living_hint(), 1);
     Ok(())
 }
 
 #[tokio::test]
 async fn next_task_pinned_classifies_an_already_queued_assignment_as_immediate()
 -> anyhow::Result<()> {
-    let (service, rg_table, _global_queue) = make_dispatch_service(DEFAULT_SESSION_ID);
-    let writer = writer_of(&rg_table, RG_ID, DEFAULT_SESSION_ID);
+    let (service, registry) = make_dispatch_service(SessionTracker::new(DEFAULT_SESSION_ID));
+    let writer = writer_of(&registry, RG_ID);
     let assignment = make_assignment(RG_ID, JOB_ID, TaskId::Index(0), DEFAULT_SESSION_ID);
     assert!(writer.try_send(assignment).is_ok());
 
@@ -292,8 +329,8 @@ async fn next_task_pinned_classifies_an_already_queued_assignment_as_immediate()
 #[tokio::test]
 async fn next_task_pinned_classifies_an_assignment_published_after_the_request_as_waited()
 -> anyhow::Result<()> {
-    let (service, rg_table, _global_queue) = make_dispatch_service(DEFAULT_SESSION_ID);
-    let writer = writer_of(&rg_table, RG_ID, DEFAULT_SESSION_ID);
+    let (service, registry) = make_dispatch_service(SessionTracker::new(DEFAULT_SESSION_ID));
+    let writer = writer_of(&registry, RG_ID);
     let assignment = make_assignment(RG_ID, JOB_ID, TaskId::Index(0), DEFAULT_SESSION_ID);
     let publisher = tokio::spawn(async move {
         tokio::time::sleep(PUBLISH_DELAY).await;
@@ -312,12 +349,10 @@ async fn next_task_pinned_classifies_an_assignment_published_after_the_request_a
 #[tokio::test]
 async fn next_task_general_classifies_an_already_hinted_assignment_as_immediate()
 -> anyhow::Result<()> {
-    let (service, rg_table, global_queue) = make_dispatch_service(DEFAULT_SESSION_ID);
-    let writer = writer_of(&rg_table, RG_ID, DEFAULT_SESSION_ID);
+    let (service, registry) = make_dispatch_service(SessionTracker::new(DEFAULT_SESSION_ID));
+    let writer = writer_of(&registry, RG_ID);
     let assignment = make_assignment(RG_ID, JOB_ID, TaskId::Index(0), DEFAULT_SESSION_ID);
     assert!(writer.try_send(assignment).is_ok());
-    writer.increment_living_hint();
-    assert!(global_queue.try_send(writer.hint()));
 
     assert_eq!(
         service.next_task_general_classified(DISPATCH_WAIT).await,
@@ -329,17 +364,12 @@ async fn next_task_general_classifies_an_already_hinted_assignment_as_immediate(
 #[tokio::test]
 async fn next_task_general_classifies_a_hint_published_after_the_request_as_waited()
 -> anyhow::Result<()> {
-    let (service, rg_table, global_queue) = make_dispatch_service(DEFAULT_SESSION_ID);
-    let writer = writer_of(&rg_table, RG_ID, DEFAULT_SESSION_ID);
+    let (service, registry) = make_dispatch_service(SessionTracker::new(DEFAULT_SESSION_ID));
+    let writer = writer_of(&registry, RG_ID);
     let assignment = make_assignment(RG_ID, JOB_ID, TaskId::Index(0), DEFAULT_SESSION_ID);
     let publisher = tokio::spawn(async move {
         tokio::time::sleep(PUBLISH_DELAY).await;
-        if writer.try_send(assignment).is_err() {
-            return false;
-        }
-        writer.increment_living_hint();
-
-        global_queue.try_send(writer.hint())
+        writer.try_send(assignment).is_ok()
     });
 
     let outcome = service.next_task_general_classified(DISPATCH_WAIT).await;
@@ -353,18 +383,12 @@ async fn next_task_general_classifies_a_hint_published_after_the_request_as_wait
 ///
 /// A tuple containing:
 ///
-/// * A dispatch service serving `session_id`.
-/// * The resource group table it dispatches from.
-/// * The hint channel it is steered by.
+/// * A dispatch service serving the session `session_tracker` holds.
+/// * The registry it dispatches from.
 fn make_dispatch_service(
-    session_id: SessionId,
-) -> (DispatchService, ResourceGroupTable, GlobalDispatchQueue) {
-    let rg_table = ResourceGroupTable::new();
-    let global_queue = GlobalDispatchQueue::new();
-    let service = DispatchService::new(
-        rg_table.clone(),
-        global_queue.clone(),
-        SessionManager::new(session_id),
-    );
-    (service, rg_table, global_queue)
+    session_tracker: SessionTracker,
+) -> (DispatchService, DispatchQueueRegistry) {
+    let registry = DispatchQueueRegistry::new(session_tracker);
+    let service = DispatchService::new(registry.clone());
+    (service, registry)
 }

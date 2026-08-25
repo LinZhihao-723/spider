@@ -297,7 +297,7 @@ impl BenchInstrumentation {
     /// # Returns
     ///
     /// The server-side latency of the requests general execution managers made that were served
-    /// without ever awaiting on an empty hint channel, which is what dispatch costs.
+    /// without ever awaiting on an empty broadcast queue, which is what dispatch costs.
     #[must_use]
     pub const fn general_immediate_dispatch_latency(&self) -> &LatencyHistogram {
         &self.general_immediate_dispatch_latency

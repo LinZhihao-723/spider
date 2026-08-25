@@ -125,7 +125,7 @@ impl LatencySamples {
 ///
 /// The benchmark reports the two separately because they are structurally different: a pinned
 /// request touches one resource group's queue and nothing else, while a general request pops the
-/// global hint channel and may traverse several stale hints before it finds work.
+/// broadcast queue of hints and may traverse several stale hints before it finds work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkerKind {
     /// An execution manager pinned to a single resource group.

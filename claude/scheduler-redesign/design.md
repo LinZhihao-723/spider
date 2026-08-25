@@ -30,14 +30,14 @@ Two properties drive the structure:
 | Global task set | core | no |
 | Finalized job table | core | no |
 | Job registry | core | no |
-| `rg_table` (dispatch queue endpoints) | resource group registry | **yes**, via `Arc<DashMap<…>>` |
+| `dispatch_queue_registry` (per-group queues and the broadcast queue) | dispatch queue registry | **yes**, via a cloneable `DispatchQueueRegistry` (one `Arc` over a `DashMap`, a `SessionTracker` clone, and both ends of the broadcast queue) |
 | `rg_units` (scheduling state) | core | no |
 | Active RG list | core | no |
-| Broadcast queue (hints) | core writes, service reads | **yes** |
+| Broadcast queue (hints) | `dispatch_queue_registry`; core writes, service reads | **yes**, inside the registry — not a component either side owns separately |
 | Reschedule queue | EM registry writes, core reads | — |
-| Session manager | spider-execution-manager | **yes** |
+| Session tracker (`SessionTracker`) | spider-core; shared by cloning the value | **yes** — the core and the dispatch queue registry each hold a clone; the dispatch service reads the current session through the registry |
 
-Everything the dispatch service touches is `Send + Sync`. Everything else is core-private, and the core **owns it outright**: job entries live in a generational arena ([§3.3](#33-job-registry)) and resource group scheduling units in an append-only `Vec` ([§3.4](#34-resource-group-registry)). Scheduling positions — an RG's active job list, its pending job queue, the per-tick downgrade buffer, the active RG list — hold keys and indices into those arenas, never co-owning handles.
+Everything the dispatch service touches is `Send + Sync`. Everything else is core-private, and the core **owns it outright**: job entries live in a generational arena ([§3.3](#33-job-registry)) and resource group scheduling units in an append-only `Vec` ([§3.4](#34-dispatch-queue-registry-and-scheduling-state)). Scheduling positions — an RG's active job list, its pending job queue, the per-tick downgrade buffer, the active RG list — hold keys and indices into those arenas, never co-owning handles.
 
 The core is single-threaded by construction, but nothing in it is single-threaded by *type*: there is no `Rc` and no `RefCell` anywhere in the scheduling structures. The core future is therefore `Send`, and the existing `spider-scheduler` runtime spawns it like any other core, with no dedicated thread and no `LocalSet`. That is the point of the arena ownership model; the properties below are what it costs and what it buys.
 
@@ -109,13 +109,25 @@ Every use of the flag was exactly that statement.
 
 This is why job entries need **generational** keys rather than plain indices. A scheduling position is *expected* to hold a key to an entry that step 2 has already removed, and dereferencing it afterwards is how the position discovers the removal — the stale dereference is the mechanism, not a bug to be avoided. With a plain index the arena would be free to hand the same slot to the next job created, and that scan would then read a live but unrelated entry: it would schedule tasks under another job's position and swap the wrong entry out of the active list, silently and with no failure to observe. A generation makes the same lookup return `None`, which is the answer the scanner wanted.
 
-### 3.4 Resource group registry
+### 3.4 Dispatch queue registry and scheduling state
 
-Split into a shared part and a core-private part. The shared part is the only thing that crosses a thread boundary; the core-private part never leaves the core.
+Split into a shared part and a core-private part. The shared part is the dispatch queue subsystem — every channel an assignment or a hint travels through — and is the only thing that crosses a thread boundary; the core-private part never leaves the core.
 
-**Shared — `rg_table: Arc<DashMap<ResourceGroupId, RgDispatchQueueEndpoints>>`**
+**Shared — `dispatch_queue_registry: DispatchQueueRegistry`**
 
 ```rust
+#[derive(Clone)]
+struct DispatchQueueRegistry {
+    inner: Arc<DispatchQueueRegistryInner>,
+}
+
+struct DispatchQueueRegistryInner {
+    table: DashMap<ResourceGroupId, RgDispatchQueueEndpoints>,
+    session_tracker: SessionTracker,     // stamps each group at creation
+    broadcast_sender: async_channel::Sender<Hint>,
+    broadcast_receiver: async_channel::Receiver<Hint>,
+}
+
 struct RgDispatchQueueEndpoints {
     sender: async_channel::Sender<TaskAssignment>,
     reader: RgDispatchQueueReader,       // cloneable, Arc-backed
@@ -130,24 +142,32 @@ struct RgDispatchQueueReaderInner {
     receiver: async_channel::Receiver<TaskAssignment>,
     living_hint: AtomicUsize,
     rg_id: ResourceGroupId,
-    session_id: SessionId,               // session in which this RG was created
+    session_id: SessionId,               // creating session, stamped from the registry's tracker
+}
+
+// Deliberately not Clone, and not Copy: consume_and_try_recv takes self.
+struct Hint {
+    reader: RgDispatchQueueReader,       // private field, private constructor
 }
 
 struct RgDispatchQueueWriter {
     sender: async_channel::Sender<TaskAssignment>,
     reader: RgDispatchQueueReader,
+    broadcast_sender: async_channel::Sender<Hint>,
 }
 ```
 
-The two sides of a group's queue are two types. The **reader** is the read side and the only path that may take from the queue: it reports `rg_id` and `session_id`, blocks a pinned execution manager on `recv_pinned`, and serves a general one with `consume_hint_and_try_recv`. The **writer** is the write side — `try_send` to publish an assignment, `queue_len` for the group's current occupancy `S`, `living_hint` for the count `H` **by value**, `increment_living_hint`, and `hint`, which returns the reader clone the broadcast queue carries ([§3.5](#35-broadcast-queue)). The writer carries no `Arc` of its own: exactly one scheduling unit owns a group's writer, and the reader inside it is already the shared handle. The write side can only ever raise `H`: there is no decrement on the writer, because the single event that would have rolled the count back — a hint send that fails — is fatal, and a core that is about to stop has no later reader of `H` to mislead ([§8.3](#83-other-invariants)).
+The registry is one `Arc` deep, not two. The `Arc` wraps the whole body, so the table inside it is a plain `DashMap`, and a registry clone is one pointer to one allocation holding the table, the session tracker, and both ends of the broadcast queue ([§3.5](#35-broadcast-queue)). That single clone is the subsystem's whole sharing mechanism: the core, the dispatch service, and every writer the registry hands out reach the same channels through it.
 
-**The writer holds a reader clone, not a bare counter handle.** The counter and the sender are two halves of one group's queue, and handing them to the scheduling unit separately would make a mismatched pair constructible — a sender for one group next to a counter for another, which nothing in the type system rejects and which would publish assignments into one queue while hinting for a different one. Pairing them inside the writer fixes the correspondence at construction, and the unit never sees the two separately. The writer reaches the counter through its reader's private `inner`, which is legal because both types live in the same module: the reader exposes no accessor to anyone, and the writer is not "anyone".
+The two sides of a group's queue are two types, and what a general execution manager spends is a third. The **reader** is the read side and the only path that may take from the queue: it reports `rg_id` and `session_id`, and blocks a pinned execution manager on `recv_pinned`. That is its whole surface — it carries no spend, so a holder of a reader and nothing else, which is exactly what the pinned path holds, has no route to `H` at all. The **hint** is the third type, one reader clone wide: its field and its constructor are both module-private, so the only way to hold a `Hint` is to have received it from the broadcast queue, and no holder of a reader can wrap one. It reports `rg_id` and `session_id` like the reader inside it, and it spends itself through `consume_and_try_recv`, which takes `self` by value; the type is neither `Clone` nor `Copy`. The **writer** is the write side, and its surface is exactly two methods: `try_send`, which publishes an assignment and then decides on its hint, and `queue_len`, which reports the group's current occupancy `S`. `try_make_hint` — which samples `S`, compares it against the count `H`, and either declines with `None` or raises `H` and yields the `Hint` the broadcast queue carries — is private to the writer, and `try_send` is its only caller. `queue_len` stays public because `S` is also read on a path that has nothing to do with hinting: the dynamic threshold of [§6](#6-admission-policy) compares it against `F` before an assignment is made at all. `try_send` reports the two closures it can meet — the group's queue, the broadcast queue — as the same error, and hands the assignment back on neither: both are fatal to the core, and a returned payload is the signature of a failure the caller is expected to retry. The writer carries no `Arc` of its own: exactly one scheduling unit owns a group's writer, the reader inside it is already the shared handle, and the broadcast sender beside it is a clone of the registry's own. Nothing in the type system enforces that count — `get_dispatch_queue_writer` clones the group's sender on every call, so any holder of a registry clone can mint a second writer for the same group. The single-writer property rests on [§5.3](#53-step-3--apply-updates-to-the-rg-registry) building a group's scheduling unit exactly once per session, and [§9](#9-session-bump) is what depends on it. The write side can only ever raise `H`: there is no decrement on the writer, because the single event that would have rolled the count back — a hint send that fails — is fatal, and a core that is about to stop has no later reader of `H` to mislead ([§8.3](#83-other-invariants)).
 
-**The read side has no way to observe or modify the counter other than `consume_hint_and_try_recv`.** The reader publishes neither the count nor a handle to it, so "decrement, then attempt the pop" is not a convention a call site is trusted to follow but the only shape the read side can express. This is a design property, not an implementation detail: the requirements of [§8.2](#82-requirements-the-proof-depends-on) that constrain the consumer — the decrement being immediate, and paired with exactly one pop attempt — hold for every caller because there is no second way to touch `H`.
+**The writer holds a reader clone, not a bare counter handle.** The counter and the sender are two halves of one group's queue, and handing them to the scheduling unit separately would make a mismatched pair constructible — a sender for one group next to a counter for another, which nothing in the type system rejects and which would publish assignments into one queue while hinting for a different one. Pairing them inside the writer fixes the correspondence at construction, and the unit never sees the two separately. The writer reaches the counter through its reader's private `inner`, which is legal because both types live in the same module: the reader exposes no accessor to anyone, and the writer is not "anyone". The broadcast sender the writer also holds needs no pairing of that kind, because one sender serves every group and a hint names its group by carrying that group's reader inside it — but it has to be *there*, because publishing the assignment and publishing its hint are one method rather than two calls a producer could order wrongly.
 
-Both endpoints live in the table because **either side may create a resource group first**. A pinned execution manager can connect before any task for its group has been scheduled, so the service creates the channel pair on demand and blocks on the reader. When the core first schedules into that group it performs the same create-or-get and takes the group's writer into its scheduling unit.
+**Neither side has any way to observe or modify the counter other than through the single method that spends or raises it — and on the read side that method can be reached at most once per hint.** The reader publishes neither the count nor a handle to it, and it publishes no spend either: the spend lives on `Hint`, takes `self`, and `Hint` is not `Clone`. So "decrement, then attempt the pop" is not a convention a call site is trusted to follow but the only shape the read side can express, and spending one hint twice is not merely discouraged but unconstructible — the second call has no value left to make it on, and there is no way to duplicate the first. `try_send` gives the write side the same property, and more of it: publishing the assignment, sampling `S`, loading `H`, comparing them, raising `H` and sending the hint are one operation, so a producer can neither observe `H`, nor raise it without the hint being published, nor sample the two counts in the wrong order, nor hint at an assignment that is not yet in the queue ([§8.1](#81-coverage)). This is a design property, not an implementation detail: the requirements of [§8.2](#82-requirements-the-proof-depends-on) that constrain the consumer — the decrement being immediate, and paired with exactly one pop attempt — hold for every caller because there is no second way to touch `H`, their *at most once* half is enforced by the type rather than observed by the caller, and the producer is left with no ordering obligation at all.
 
-Methods on the table: `get_dispatch_queue_reader(rg_id)` (create if absent, used by the service), `get_or_create(rg_id)` (used by the core), `clear()`. `RgDispatchQueueEndpoints::writer()` packs the entry's sender together with a clone of *that entry's* reader; it is the only way a writer is built.
+Both endpoints live in the registry's table because **either side may create a resource group first**. A pinned execution manager can connect before any task for its group has been scheduled, so the service creates the channel pair on demand and blocks on the reader. When the core first schedules into that group it calls `get_dispatch_queue_writer`, which performs the same create-or-get and hands back the group's writer — the group's sender, a clone of the group's reader, and a clone of the registry's broadcast sender — for its scheduling unit. The stamp a group is created with is read from the registry's own `SessionTracker`, which is why the registry holds a clone of the tracker rather than taking a session id per call.
+
+Methods on the registry: `new(session_tracker)`, `get_dispatch_queue_reader(rg_id)` (used by the service), `get_dispatch_queue_writer(rg_id)` (used by the core), `next_hint(wait_time)`, which yields a `Hint` (used by the service, [§7.2](#72-general-execution-manager)), `len()`, `clear()`. Both group accessors create the group on demand through one private `get_or_create`, which is where the session stamp is applied. A writer packs the entry's sender together with a clone of *that entry's* reader and a clone of the registry's broadcast sender; that is the only way a writer is built, and it is reached only through `get_dispatch_queue_writer`.
 
 **Core-private:**
 
@@ -180,32 +200,34 @@ enum FinalizeKind { Commit, Cleanup }
 
 ### 3.5 Broadcast queue
 
-An **unbounded** `async_channel` of `RgDispatchQueueReader`.
+An **unbounded** `async_channel` of `Hint`, owned by the dispatch queue registry ([§3.4](#34-dispatch-queue-registry-and-scheduling-state)), which holds **both** its sender and its receiver. It is not a component either side owns separately: the core publishes through the broadcast sender inside a group's writer, and the service consumes through the registry's `next_hint`.
 
-Every element is a **hint**, and a hint names a resource group and nothing else: it is what tells a general execution manager which group to try next, so that general capacity rotates over the groups rather than favouring whichever one it happened to look at. Hints are the only mechanism steering general execution managers; a pinned one never consults the broadcast queue at all.
+Every element is a **hint** — a `Hint` ([§3.4](#34-dispatch-queue-registry-and-scheduling-state)), which is one group's reader wrapped in a value that can be spent once — and a hint names a resource group and nothing else: it is what tells a general execution manager which group to try next, so that general capacity rotates over the groups rather than favouring whichever one it happened to look at. Hints are the only mechanism steering general execution managers; a pinned one never consults the broadcast queue at all.
 
 A hint is an invitation, not a promise, and it is worth being explicit about how weak a claim it makes:
 
-- **A hint does not guarantee an entry.** By the time its holder reaches the named group's queue, a pinned execution manager may have taken the assignment the hint was published for. The holder then finds the queue empty, discards the hint, and moves on to the next one. §8.1 shows this costs nothing: a hint is consumed either way, and coverage is maintained over the group's whole queue rather than over any individual assignment.
+- **A hint does not guarantee an entry.** By the time its holder reaches the named group's queue, a pinned execution manager may have taken the assignment the hint was published for. The holder then finds the queue empty, having spent the hint for nothing, and moves on to the next one. §8.1 shows this costs nothing: a hint is consumed either way, and coverage is maintained over the group's whole queue rather than over any individual assignment.
 - **A hint does not name an entry.** It says only "try this group". If the group's queue holds several assignments, which one the holder receives is whatever the channel yields — the hint carries no claim on a particular assignment, and two holders of hints for the same group take different assignments without coordinating.
 
 The **living hint** counter, `living_hint`, is the per-group half of this structure: an atomic count of how many hints naming that group are currently outstanding in the broadcast queue. The core increments it when it publishes a hint and a general execution manager decrements it when it takes one, so the count is what the publishing rule of [§5.4](#54-step-4--dispatch-queue-filling) consults to decide whether another hint is needed. That rule caps each group's outstanding hints at that group's peak queue occupancy ([§8.1](#81-coverage)).
 
-The counter is a plain `AtomicUsize` inside `RgDispatchQueueReaderInner` ([§3.4](#34-resource-group-registry)), not a separately shared handle. The reader's `Arc` is the one sharing mechanism the group's queue has, and the writer reaches the counter through the reader clone it holds — which is why a hint and the counter it accounts for can never name different groups.
+The counter is a plain `AtomicUsize` inside `RgDispatchQueueReaderInner` ([§3.4](#34-dispatch-queue-registry-and-scheduling-state)), not a separately shared handle. The reader's `Arc` is the one sharing mechanism the group's queue has, and the writer reaches the counter through the reader clone it holds — which is why a hint and the counter it accounts for can never name different groups.
 
-The core is this queue's only writer, and a closed broadcast queue is fatal to it: the read side is gone, no general execution manager will ever see a hint again, and there is no second channel through which general capacity could be steered. The reader side is the opposite case — a hint whose group was cleared by a session bump leads to a closed queue, which is simply the end of that session's work and yields no assignment. Closure is a failure on the side that publishes and an ordinary end of session on the side that consumes ([§8.3](#83-other-invariants)).
+The core is this queue's only writer, and a closed broadcast queue is fatal to it: the read side would be gone, no general execution manager would ever see a hint again, and there is no second channel through which general capacity could be steered.
+
+**That closure is no longer reachable in a running scheduler.** An `async_channel` closes only once all of its senders or all of its receivers are dropped, and the registry holds one of each for as long as it lives — so the broadcast queue can close only after the registry itself is gone, which is to say once the scheduler is shutting down. The write side keeps treating closure as fatal ([§8.3](#83-other-invariants)); what changed is that the case is unreachable rather than merely unexpected, and the error variant remains in the type because a hint queue nobody can read must still stop a core that publishes into it. The consuming side changes with it: a general execution manager no longer ends on a closed broadcast queue but on an empty one, which is why `next_hint` takes a wait time ([§7.2](#72-general-execution-manager)). Closure is still the ordinary end of a session on the *group* queue a hint leads into, which does close when a bump drops its senders — a failure on the side that publishes, an ordinary end of session on the side that consumes ([§8.3](#83-other-invariants)).
 
 The queue must be unbounded because those peaks are not simultaneous: their sum can exceed `dispatch_queue_capacity`, and a rejected hint send would break the coverage invariant with no way to detect or repair it.
 
-Sending a hint clones an `Arc`, not a channel receiver.
+Sending a hint clones an `Arc`, not a channel receiver: a `Hint` is one reader clone wide.
 
 ### 3.6 Reschedule queue
 
 An unbounded channel written by the EM registry when an execution manager is lost or times out, drained by the core in step 1. Entries are filtered identically to inbound entries: assignments carrying a stale session are dropped, and regular tasks for finalized jobs are dropped.
 
-### 3.7 Session manager
+### 3.7 Session tracker
 
-The global session manager from spider-execution-manager. Provides `bump()` and `current()`.
+`spider_core::session::SessionTracker` — a cloneable handle over a shared `Arc<AtomicU64>`; clones share the one counter, so it is passed by value and needs no outer `Arc`. Provides `current()` and `try_advance(new_sid) -> bool`, a CAS loop that no-ops when the stored value is already `>= new_sid` and reports whether it advanced.
 
 ## 4. Tick overview
 
@@ -258,7 +280,7 @@ struct RgUpdate {
 
 For each entry in `rg_updates`:
 
-- Look the group up in `rg_index`. If absent, create the scheduling unit (via `rg_table.get_or_create`, taking the group's writer), push it onto `rg_units`, and record its index in `rg_index`. This is the only place either is written.
+- Look the group up in `rg_index`. If absent, create the scheduling unit (via `dispatch_queue_registry.get_dispatch_queue_writer(rg_id)`, which creates the group if it has none and hands back its writer, broadcast sender included), push it onto `rg_units`, and record its index in `rg_index`. This is the only place either is written.
 - Append the finalized jobs to `finalize_queue`.
 - Place each new job key: append to `active_jobs` if it is below `active_job_list_capacity`, otherwise push to the back of `pending_jobs`.
 - If `is_active` is false, set it and append the unit's index to `active_rg_list`.
@@ -269,7 +291,7 @@ Only newly created job entries need placement: an entry that already existed is 
 
 This is the scheduling policy. The active RG list is **not** modified during the step; a per-tick copy `rg_rr_list` is used, and deactivations are buffered and applied at the end.
 
-**a. Set up.** Destructure the core's fields — `rg_units`, the job registry, the global task set, the broadcast queue writer — into separate `&mut` bindings, so the step's inner operations borrow disjoint parts of the core rather than the whole of it. See [`try_make_assignment`](#try_make_assignment) below. Create `jobs_to_retire: Vec<JobKey>`.
+**a. Set up.** Destructure the core's fields — `rg_units`, the job registry, the global task set — into separate `&mut` bindings, so the step's inner operations borrow disjoint parts of the core rather than the whole of it. The broadcast queue is not among them: a unit publishes hints through the broadcast sender inside its own writer ([§3.4](#34-dispatch-queue-registry-and-scheduling-state)), so no queue writer is carried down the call chain any more. See [`try_make_assignment`](#try_make_assignment) below. Create `jobs_to_retire: Vec<JobKey>`.
 
 **b. Single pass over `active_rg_list`** doing three things at once:
 
@@ -285,11 +307,11 @@ Set `arm = (k + 1) % rg_rr_list.len()`, or `0` if `last_served_rg` is absent fro
 
 **d. Round-robin loop.** Terminates when `F == 0` or `rg_rr_list` is empty.
 
-```
+```rust
 loop {
     if F == 0 || rg_rr_list.is_empty() { break }
     let unit = &mut rg_units[rg_rr_list[arm]];
-    match unit.try_make_assignment(&mut F, job_registry, &broadcast_writer) {
+    match unit.try_make_assignment(&mut F, job_registry) {
         Ok((job_id, task_id)) => {
             global_task_set.remove(&(job_id, task_id));
             F -= 1;
@@ -307,7 +329,7 @@ loop {
 }
 ```
 
-Only `NoTask` and `DispatchQueueFull` end a group's turn. Both say the group has nothing more to give *this tick* — it ran out of schedulable work, or it reached the admission threshold — and the rotation continues over the groups that remain. `DispatchQueueClosed` and `BroadcastQueueClosed` say something else entirely: a queue the core writes into has lost its far end. There is no group to drop and no tick to finish, so the error leaves the loop, leaves the tick, and stops the core ([§8.3](#83-other-invariants)).
+Only `NoTask` and `DispatchQueueFull` end a group's turn. Both say the group has nothing more to give *this tick* — it ran out of schedulable work, or it reached the admission threshold — and the rotation continues over the groups that remain. `DispatchQueueClosed` says something else entirely: a queue the core writes into — the group's own or the broadcast queue — has lost its far end. There is no group to drop and no tick to finish, so the error leaves the loop, leaves the tick, and stops the core ([§8.3](#83-other-invariants)).
 
 **e. Apply buffered state.** Process the downgrade buffer ([§5.5](#55-promotion-downgrade-and-retirement)), then for every unit that reported `NoTask`, deactivate it if and only if it has **no schedulable tasks and an empty dispatch queue** — clear `is_active` and swap-remove it from `active_rg_list`.
 
@@ -317,7 +339,7 @@ Note the two removals are distinct. Removal from `rg_rr_list` means "nothing mor
 
 #### `try_make_assignment`
 
-A method on `RgSchedulingUnit`, taking `&mut F`, `&mut JobRegistry`, and the broadcast queue writer as parameters. It needs `&mut RgSchedulingUnit` and `&mut` the job arena **at the same time**: it reads and mutates the unit's `active_jobs` and `rr_arm` while resolving the keys they hold into entries it pops tasks from.
+A method on `RgSchedulingUnit`, taking `&mut F` and `&mut JobRegistry` as parameters. It needs `&mut RgSchedulingUnit` and `&mut` the job arena **at the same time**: it reads and mutates the unit's `active_jobs` and `rr_arm` while resolving the keys they hold into entries it pops tasks from.
 
 That is why it is a method on the unit and not on the core. `self.rg_units[i].try_make_assignment(&mut self.job_registry, …)` reached through a method on the core's `&mut self` is rejected — the method call borrows all of `self`, so the argument cannot borrow a field of it. The caller therefore destructures the core's fields first ([step a](#54-step-4--dispatch-queue-filling)) and passes two disjoint `&mut` bindings, which the borrow checker accepts because they name different fields. This is checked statically: there is no runtime borrow to fail.
 
@@ -327,13 +349,15 @@ That is why it is a method on the unit and not on the core. `self.rg_units[i].tr
 4. Otherwise take a regular task:
    - Resolve the key of the active job at `rr_arm`. If it does not resolve, the job has been removed — swap it out for the next key in `pending_jobs` that does resolve.
    - Call `get_next_task()` on the resolved entry. If it yields nothing, decrement that job's `downgrade_counter`; if the counter reaches zero, buffer the job for downgrade and swap in the next pending job, otherwise advance `rr_arm` to the next active job.
-5. Publish the resulting assignment through the unit's writer, **in this order**:
-   - `writer.try_send(assignment)` — into the group's own queue first, so a pinned execution manager can take it immediately. The queue is unbounded, so the send fails only if the channel is closed, which returns `Err(DispatchQueueClosed)`;
-   - then compare `writer.living_hint()` `H` against `writer.queue_len()` `S`. If `H >= S`, done. Otherwise `writer.increment_living_hint()` and send `writer.hint()` — a reader clone — to the broadcast queue. That queue is unbounded too, so this send likewise fails only on closure, which returns `Err(BroadcastQueueClosed)`.
+5. Publish the resulting assignment through the unit's writer: one call, `writer.try_send(assignment)`.
+
+   `try_send` sends the assignment into the group's own queue first, so a pinned execution manager can take it immediately, and only then decides whether the group needs a hint: it samples the group's occupancy `S`, loads `H`, and stops when `H >= S` — the group's outstanding hints already cover its queue, so no hint is needed — otherwise raising `H` and sending the hint it takes out into the broadcast queue. Both queues are unbounded, so either send fails only on closure, and both closures return the same `Err(DispatchQueueClosed)`: the caller has nothing to branch on, and the broadcast half is unreachable while the registry lives in any case ([§3.5](#35-broadcast-queue)).
+
+   Every ordering this step used to own is now internal to that one call ([§3.4](#34-dispatch-queue-registry-and-scheduling-state)): the assignment reaching the queue before `S` is sampled, `S` being sampled before `H`, and a hint that has been taken out being sent rather than dropped. The step cannot get any of them wrong, because it makes one call and never sees a hint.
 
    Neither failure is rolled back. The increment is not undone and the published assignment is not withdrawn, because a closed queue on the write side stops the core ([§8.3](#83-other-invariants)): there is no next tick that could read an overstated `H`, and nothing left to repair for. Rollback would only be worth writing if the core intended to keep scheduling afterwards, and it does not.
 
-The ordering in step 5 is normative; reversing it lets a general execution manager consume a hint for an assignment that is not yet visible. See [§8](#8-invariants).
+The ordering inside `try_send` is normative: reversing it lets a general execution manager consume a hint for an assignment that is not yet visible. It is structural now rather than a rule a call site follows. See [§8](#8-invariants).
 
 Any operation that leaves the group with nothing further to schedule returns `Err(NoTask)`.
 
@@ -411,17 +435,19 @@ The rotation in [§5.4](#54-step-4--dispatch-queue-filling) satisfies both.
 
 ### 7.1 Pinned execution manager
 
-The service looks up the group in `rg_table`, creating it if absent, and clones the `RgDispatchQueueReader`. It then blocks on `recv_pinned` until an assignment arrives, the request's wait time expires, or the queue closes under a session bump. The last of those is not an error: `recv_pinned` returns no assignment, exactly as it does on a timeout ([§8.3](#83-other-invariants)).
+The service looks up the group in the dispatch queue registry, creating it if absent, and clones the `RgDispatchQueueReader`. It then blocks on `recv_pinned` until an assignment arrives, the request's wait time expires, or the queue closes under a session bump. The last of those is not an error: `recv_pinned` returns no assignment, exactly as it does on a timeout ([§8.3](#83-other-invariants)).
 
-The reader is re-fetched per request, so a session bump that replaces `rg_table` is picked up on the next call.
+The reader is re-fetched per request, so a session bump that clears the registry is picked up on the next call.
 
 ### 7.2 General execution manager
 
-The service blocks on the broadcast queue. On receiving an `RgDispatchQueueReader` it calls `consume_hint_and_try_recv`, which decrements `living_hint` — **immediately, with no await point between the receive and the decrement** — and then attempts one `try_recv` on the group's queue. On success the assignment is returned. On empty the hint was stale: the service moves on to the next hint.
+The service blocks on the broadcast queue through the registry's `next_hint(wait_time)`. On receiving a `Hint` it reads `session_id()` first: a hint of a stale session is dropped unspent, which costs no counter anything, and the service goes back for another ([§8.2](#82-requirements-the-proof-depends-on)). Otherwise it calls `consume_and_try_recv`, which takes the hint by value, decrements `living_hint` — **immediately, with no await point between the receive and the decrement** — and then attempts one `try_recv` on the group's queue. On success the assignment is returned. On empty the hint was stale: the service moves on to the next hint.
 
-The decrement and the pop attempt are one method rather than two steps at the call site because that is the only counter access the read side has ([§3.4](#34-resource-group-registry)); a caller cannot decrement twice, decrement without attempting, or await in between.
+The decrement and the pop attempt are one method rather than two steps at the call site because that is the only counter access the read side has ([§3.4](#34-dispatch-queue-registry-and-scheduling-state)), and the method consumes the hint it is called on; a caller cannot decrement twice, decrement without attempting, or await in between. The first of those stopped being a rule and became a compile error: the call moves the `Hint`, and there is no `Clone` to make a second one from.
 
-A closed channel is an expected outcome on this path, not a failure. A session bump clears `rg_table` and the scheduling units together, dropping every sender a group's queue had ([§9](#9-session-bump)); a general execution manager blocked on the broadcast queue, or holding a hint whose group has since been cleared, therefore finds the channel closed rather than empty. The two are the same answer here — no assignment is coming — and both reader methods return an `Option` that collapses them, so the service falls through to its retry exactly as it does for an empty queue. This is the read half of the rule in [§8.3](#83-other-invariants): the side that publishes treats closure as fatal, the side that consumes treats it as the end of a session's queue.
+**The wait on the broadcast queue is bounded, and has to be.** The registry holds both ends of that queue, so it does not close while the registry lives ([§3.5](#35-broadcast-queue)) and an open-ended wait on an empty queue would never return. `next_hint` therefore takes the same `wait_time` a pinned request spends on `recv_pinned`, and returns no hint when it expires — which says only that no group currently has uncovered work.
+
+A closed channel is still an expected outcome one step further on, where the hint leads. A session bump clears the registry's table and the scheduling units together, dropping every sender a group's queue had ([§9](#9-session-bump)); a general execution manager holding a hint whose group has since been cleared therefore finds that group's queue closed rather than empty. The two are the same answer here — no assignment is coming — and both read paths return an `Option` that collapses them, so the service falls through to its retry exactly as it does for an empty queue. This is the read half of the rule in [§8.3](#83-other-invariants): the side that publishes treats closure as fatal, the side that consumes treats it as the end of a session's queue.
 
 No republication is required. The core's per-admission check alone maintains coverage.
 
@@ -466,22 +492,30 @@ The last step uses `S ≥ q`, which holds because the assignment is sent to the 
 
 It does **not** follow that the total is bounded by `dispatch_queue_capacity`. `H` is decremented only by a general execution manager, so a pinned execution manager draining a group lowers `S` while leaving `H` at the old peak. The bound is `Σ_r peak(S_r)`, and those peaks are not simultaneous — a group backlogged alone reaches `B/2` under α = 1, so `N` groups that go backlogged in turn, each drained by its own pinned execution managers, can leave up to `N·B/2` hints outstanding with the buffer empty. The queue is therefore unbounded ([§3.5](#35-broadcast-queue)); the alternative is a rejected send, which breaks the invariant silently.
 
-**Memory ordering.** `living_hint` is incremented only by the core and decremented only by general execution managers, so the check-then-increment needs no compare-exchange: a decrement landing between the read and the increment only lowers `H` further, which strengthens the condition that triggered publication. `Acquire`/`Release` suffices; sequential consistency is not required. Under acquire-release the core may miss a concurrent decrement and read `H` too high, skipping a publication — which is safe, because an unobserved decrement corresponds precisely to an execution manager that has entered flight and is therefore already counted in `m`.
+**Memory ordering.** `living_hint` is incremented only by the core and decremented only by general execution managers, so the check-then-increment needs no compare-exchange: a decrement landing between the read and the increment only lowers `H` further, which strengthens the condition that triggered publication. The two reads of the check are ordered for the same reason: `try_make_hint` samples `S` before it loads `H`, so a decrement landing between them can only lower the `H` this comparison sees. That order lives inside the writer — `try_make_hint` is private and `try_send` is its only caller ([§3.4](#34-dispatch-queue-registry-and-scheduling-state)) — rather than in a comment at a call site, so no producer can reverse it. `Acquire`/`Release` suffices; sequential consistency is not required. Under acquire-release the core may miss a concurrent decrement and read `H` too high, skipping a publication — which is safe, because an unobserved decrement corresponds precisely to an execution manager that has entered flight and is therefore already counted in `m`. The decrement itself is a plain `fetch_sub` under `AcqRel` — unchecked, with no clamp at zero and no compare-exchange — because hint accounting pairs every decrement with a distinct earlier increment ([§8.3](#83-other-invariants)), so the subtraction cannot underflow and a clamp could only disguise a violation of that pairing as a plausible count.
 
 ### 8.2 Requirements the proof depends on
 
-Four, each of which fails silently:
+Four. The first is no longer trusted to anyone — the writer's shape enforces it — and is recorded here because that shape is what the proof now rests on; requirements 3 and 4 are now enforced in part by the hint's shape in the same way, and each names below what it still owes its caller. Every obligation that is left fails silently:
 
-1. The assignment is sent to the group's queue **before** `H` is compared against `S`.
+1. The assignment is sent to the group's queue **before** `H` is compared against `S`. Nothing outside the writer can get this wrong: `try_send` performs the send, samples `S`, loads `H`, compares them, raises `H` and publishes the hint as one operation ([§3.4](#34-dispatch-queue-registry-and-scheduling-state)), so a producer has nothing left to order and no hint it could fail to send. What survives is an obligation on the writer's own body, discharged by reading one method rather than every call site.
 2. Neither send may block or fail. **No channel in this design is bounded by its type** — both the per-group queues and the broadcast queue are unbounded, and the algorithm is what bounds them. The admission threshold `S < F` is the sole limit on a group's occupancy, and hence on the buffer's; the publishing rule `H < S` is the sole limit on a group's hints. A channel capacity would be a redundant second limit measured against the wrong quantity — a per-group bound against a buffer-wide budget — whose only reachable effect is to reject a send the proof requires to succeed.
-3. No await point between the broadcast queue receive and `H -= 1`, so cancellation cannot strand a decrement. The region must also not panic.
-4. Hints carry a session generation; a general execution manager holding a stale-generation hint discards it **without touching any counter**.
+3. The decrement is immediate and paired with exactly one pop attempt. Half of this is now structural rather than owed: `consume_and_try_recv` decrements and then attempts a single pop as one method, it lives on `Hint`, and it takes `self` — so no caller can decrement twice, decrement without attempting, or spend a hint it has already spent, and no caller can clone a hint to try. The other half remains an obligation, because the type cannot express it: no await point between the broadcast queue receive and `H -= 1`, so cancellation cannot strand a decrement, and the region must not panic. A hint dropped at an await point is dropped legally; it is simply never spent, and its increment is never matched.
+4. A hint carries the session its group was created in (`Hint::session_id()`), and a general execution manager whose hint names a stale session discards it **without touching any counter** — `session_id()` sits on the hint so that the consumer can inspect it before spending it, and dropping a `Hint` is free: there is no `Drop` impl, and `consume_and_try_recv` is the only thing that ever lowers a counter. The counter that stays raised belongs to a group the bump dropped, which no live reader consults again, so nothing of the live session is left uncovered ([§8.3](#83-other-invariants)). What the read side has no way to do is touch the counter by any route other than `Hint::consume_and_try_recv` ([§3.4](#34-dispatch-queue-registry-and-scheduling-state)) — a reader on its own has no spend at all — which is what requirement 3 protects. A bump also discards every hint still queued in the broadcast queue ([§9](#9-session-bump)), so the stale hints that reach this path are only those already in a request's hand when the bump landed.
 
 ### 8.3 Other invariants
 
 **Dedup scope.** A `(JobId, TaskId)` is in the global task set exactly while it is buffered in the core, from job-registry insertion to assignment publication.
 
 **Occupancy accounting.** Every resource group holding assignments is in `active_rg_list`, so `F` never over-states free space.
+
+**Hint accounting.** A group's `living_hint` is raised exactly once per hint the core publishes into the broadcast queue and lowered exactly once per hint a general execution manager consumes, and the broadcast queue delivers each hint to exactly one execution manager — so every decrement pairs with a distinct earlier increment, and the count can never fall below zero. The set of paths that could pair two decrements with one increment is empty by construction: the spend lives on `Hint`, takes `self`, and the type is not `Clone` ([§3.4](#34-dispatch-queue-registry-and-scheduling-state)), so a hint delivered once cannot be spent twice. The set of paths that leave an increment *unmatched* is exactly what it was, and the type does nothing about it — those paths are described below, unchanged. The decrement is therefore an unchecked subtraction rather than a clamped one: a floor at zero would protect nothing, and would only hide a broken pairing behind a plausible count.
+
+A session bump does not disturb that pairing, but it does leave some increments unmatched, deliberately. Clearing the registry discards every hint the broadcast queue still holds and withdraws nothing from any counter ([§9](#9-session-bump)), so each discarded hint is an increment whose decrement will never arrive. The pairing the unchecked subtraction depends on is directional — no decrement without a distinct earlier increment — and discarding hints only ever removes decrements, so it cannot be what breaks it. The counters concerned belong to groups the same operation dropped, which no reader of the new session resolves to; the group the new session re-creates starts from a fresh counter at zero. A hint already in a general execution manager's hand when the bump lands is out of the discard's reach, and is left unmatched for the same reason and to the same effect: the request finds the hint's session stale and drops it without decrementing ([§8.2](#82-requirements-the-proof-depends-on)), so its increment joins the drained ones on a counter of a group that is already gone.
+
+**Hint publication.** `H` is raised before the hint it accounts for reaches the broadcast queue, so a hint taken out and then dropped would leave the group's outstanding hints one short of covering its queue for the rest of the session: the next publication would find the queue already covered and be skipped, hinting would resume only once the queue grew past the inflated count, and one assignment could sit unclaimed at every later queue peak for want of a general execution manager. This is a different failure from the transient over-read [§8.1](#81-coverage) blesses as safe: there the unobserved change is a decrement, which corresponds to an execution manager already counted in `m`, whereas a hint that is never sent corresponds to nothing at all.
+
+That window is now closed by construction on the producing side. `try_make_hint` is private to the writer and `try_send` is its only caller, which sends what it is handed in its next statement ([§3.4](#34-dispatch-queue-registry-and-scheduling-state)); there is no *publishing* call site left that could take a hint out and drop it. The one publishing path that still raises `H` without a hint reaching a consumer is a broadcast send that fails, which stops the core outright — see below. Two further paths leave an increment permanently unmatched, both deliberately and both benign for the same reason: the bump's discard of the hints still queued in the broadcast queue, and a general execution manager's discard of a stale-session hint it had already taken ([§8.2](#82-requirements-the-proof-depends-on)). Each of those counters belongs to a group the bump dropped, so the coverage it overstates is coverage of a queue nothing reads again.
 
 **Job placement.** A job entry is owned by the job registry, and its key is held by exactly one scheduling position: an active job list, a pending job queue, or the per-tick downgrade buffer.
 
@@ -491,27 +525,32 @@ No path in the design needs two job entries mutably at once. One that did would 
 
 **Channel closure.** A closed channel is fatal on the write side and expected on the read side, and the two cases are read differently everywhere in this design.
 
-The core is the sole writer of every group's dispatch queue and of the broadcast queue. A closed channel there means the far end no longer exists — nobody will ever take that group's assignments, or no general execution manager will ever see another hint — and neither is something a later tick can repair: there is no second queue to publish into and no state to restore. The core therefore returns an error and stops rather than logging and continuing to tick. Dying is an affordable response precisely because no production path closes either channel: while the design's ownership holds, the write side never sees a closure, so the policy costs nothing in the expected case and gives up nothing in the unexpected one, where the alternative is a core that ticks on publishing into a queue nobody reads. This is what removes the rollback from publication ([§5.4](#54-step-4--dispatch-queue-filling)): the only send failure left is one the core does not survive, so there is no surviving `H` for a decrement to correct.
+The core is the sole writer of every group's dispatch queue and of the broadcast queue. A closed channel there means the far end no longer exists — nobody will ever take that group's assignments, or no general execution manager will ever see another hint — and neither is something a later tick can repair: there is no second queue to publish into and no state to restore. The core therefore returns an error and stops rather than logging and continuing to tick. Dying is an affordable response precisely because no production path closes either channel: while the design's ownership holds, the write side never sees a closure, so the policy costs nothing in the expected case and gives up nothing in the unexpected one, where the alternative is a core that ticks on publishing into a queue nobody reads.
 
-The read side is the mirror image. A group's queue closes only when every sender has been dropped, which is precisely what a session bump does ([§9](#9-session-bump)) — so a reader already blocked in `recv_pinned`, or one following a hint into a group that has since been cleared, is *supposed* to find its channel closed. That is the end of a bumped session's queue, not a fault in it. Both reader methods return an `Option` and give *closed* and *empty* the same answer, `None`: no assignment. Their signatures are chosen for that reason, and not merely because an `Option` was convenient to produce.
+The two closures differ in how reachable they are, but not in anything a caller can do about them, and the type is written to the second fact rather than the first: both are reported as `DispatchQueueClosed`. A group's queue is closable in principle — it closes when the registry's entry and the scheduling unit's writer are both dropped, which [§9](#9-session-bump) does in one operation — so that error, raised on a group's own send, says precisely that those two clears drifted apart. The broadcast queue cannot close at all while the registry lives, since the registry holds both of its ends ([§3.5](#35-broadcast-queue)), so the same error raised on the hint send names a scheduler that has already been torn down. Giving that case a name of its own would have advertised a distinction that is simultaneously unreachable and unactionable: both closures stop the core, neither leaves anything to recover, and no caller has a branch to put them in. This is what removes the rollback from publication ([§5.4](#54-step-4--dispatch-queue-filling)): the only send failure left is one the core does not survive, so there is no surviving `H` for a decrement to correct.
+
+The read side is the mirror image. A group's queue closes only when every sender has been dropped, which is precisely what a session bump does ([§9](#9-session-bump)) — so a reader already blocked in `recv_pinned`, or one following a hint into a group that has since been cleared, is *supposed* to find its channel closed. That is the end of a bumped session's queue, not a fault in it. Both read paths — the reader's `recv_pinned` and the hint's `consume_and_try_recv` — return an `Option` and give *closed* and *empty* the same answer, `None`: no assignment. Their signatures are chosen for that reason, and not merely because an `Option` was convenient to produce.
 
 ## 9. Session bump
 
 Detected in step 1 from the session ID returned by the inbound-queue gRPC calls, and applied at the end of that step, in this order:
 
-1. **Bump the global session ID.** Assignments already taken from the broadcast queue now fail their session check and are dropped by the service.
-2. **Clear the resource group registry** — every entry in `rg_table`, and `rg_units`, `rg_index`, and `active_rg_list` **together, in this one operation**.
+1. **Advance the shared session tracker** — `session_tracker.try_advance(new_sid)`. A hint already taken from the broadcast queue now names a stale session, and an assignment already taken from a group's queue now fails its own session check; the service drops both. The advance must land *before* the clear in step 2: the registry stamps every group it creates with its tracker's current session, so a group re-created in the window between the two would carry the outgoing session id.
+2. **Clear the resource group state** — every entry in the dispatch queue registry's table *and* every hint its broadcast queue still holds, together with `rg_units`, `rg_index`, and `active_rg_list`, **in this one operation**. The registry's `clear` is what does the first two.
 3. **Clear the job registry** — both `jobs` and `by_job_id`.
 4. **Clear the global task set and the finalized job table.** Required: storage replays its ready tasks after a bump, and stale dedup entries would cause every replayed task to be dropped with nothing left in the registry to schedule it from.
-5. **Drain the broadcast queue.**
 
-Per-group queues are not drained explicitly; they are dropped with `rg_table`. An execution manager still blocked on an old reader keeps it alive but its assignments fail the session check.
+Per-group queues are not drained explicitly; they are dropped with the registry's table. An execution manager still blocked on an old reader keeps it alive but its assignments fail the session check.
 
-**Step 2 is a correctness requirement, not tidiness.** Clearing `rg_units` is the one event that invalidates positions in it, and `rg_units` is a plain `Vec` precisely because that event is the only one ([§3.4](#34-resource-group-registry)). Indices carry no generation, so a surviving `active_rg_list` entry or `rg_index` value would resolve against the new session's units — either out of bounds, or, once the new session has re-created a few groups, silently against the wrong group. Both index holders must therefore be cleared in the same operation as the `Vec` they index; the type system does not check this, and it is why the three are named together above rather than left to the reader.
+**Step 2 is a correctness requirement, not tidiness.** Clearing `rg_units` is the one event that invalidates positions in it, and `rg_units` is a plain `Vec` precisely because that event is the only one ([§3.4](#34-dispatch-queue-registry-and-scheduling-state)). Indices carry no generation, so a surviving `active_rg_list` entry or `rg_index` value would resolve against the new session's units — either out of bounds, or, once the new session has re-created a few groups, silently against the wrong group. Both index holders must therefore be cleared in the same operation as the `Vec` they index; the type system does not check this, and it is why the three are named together above rather than left to the reader.
 
-**The same operation is a correctness requirement for a second reason.** A group's queue closes only once *every* sender to it is dropped, and there are exactly two: the table entry's, and the one inside the scheduling unit's writer ([§3.4](#34-resource-group-registry)). Dropping both together is what makes the bump observable to the readers still blocked on that queue — they wake to a closed channel and report no assignment, which is the benign half of [§8.3](#83-other-invariants). Clear only the table and the queue does not close at all: the surviving unit keeps publishing into a queue the new session's readers no longer resolve to, since the table hands out a freshly created queue for the same group. Clear only the units and the table serves readers for a queue nothing will fill again.
+**The same operation is a correctness requirement for a second reason.** A group's queue closes only once *every* sender to it is dropped, and in this design there are exactly two: the registry entry's, and the one inside the scheduling unit's writer ([§3.4](#34-dispatch-queue-registry-and-scheduling-state)). The count is upheld by [§5.3](#53-step-3--apply-updates-to-the-rg-registry) building a group's unit exactly once per session, not by the type system — every further `get_dispatch_queue_writer` call for the same group would add another sender. Dropping both together is what makes the bump observable to the readers still blocked on that queue — they wake to a closed channel and report no assignment, which is the benign half of [§8.3](#83-other-invariants). Clear only the registry and the queue does not close at all: the surviving unit keeps publishing into a queue the new session's readers no longer resolve to, since the registry hands out a freshly created queue for the same group. Clear only the units and the registry serves readers for a queue nothing will fill again.
 
 Under the previous handling either divergence was a leak the core logged and survived. It is not survivable now. The core holds the writer, and a writer that finds its channel closed stops the scheduler rather than reporting a stale group it can skip — so any later change that lets the two clears drift apart, or that closes a group's queue while its unit still lives, converts a leak into the core's death on the next publication. The two clears must stay one operation.
+
+**The broadcast drain is part of that one operation, and it is required.** Every other channel of the subsystem resets itself at a bump: a group's queue closes once the registry's entry and the unit's writer are dropped, and the assignments in it die with it. The broadcast queue does not, because the registry holds both of its ends and the registry outlives the bump ([§3.5](#35-broadcast-queue)) — it is the one structure a bump has to empty explicitly rather than by dropping something. A hint left in it names a group the same operation has just dropped, and would be handed to a general execution manager of the *new* session, which reads its stale session id, discards it, and goes back for another ([§8.2](#82-requirements-the-proof-depends-on)). Coverage is not violated — the re-created groups hint for themselves from fresh counters — but the new session's general capacity would spend its turns on the old session's litter, and a bump that lands while several groups are backlogged can leave a great deal of it. That is why the drain lives inside `clear`, where the one call that drops the groups also discards the hints naming them, rather than at a call site that can forget it.
+
+The drain runs *after* the table is cleared, and the order is free of cost either way: the core is the sole publisher of hints and is itself executing the bump, so no publication can race the drain. Clearing first is the stronger of the two orders, because it makes the postcondition unconditional — once the table is empty, every hint the queue could still hold names a group that is already gone — whereas draining first leaves a window that only the single-publisher premise closes. The drain withdraws nothing from any `living_hint`, and the values it discards are `Hint`s, which have no `Drop` impl and so cost nothing to drop: those counters belong to the groups this same operation dropped, no live reader consults them again, and a decrement is owed only by a holder of the hint it decrements ([§8.3](#83-other-invariants)).
 
 Job keys need no such care. A key held across the bump fails to resolve against the cleared arena, which is the same `None` any stale key produces — the bump is not a special case for them.
 

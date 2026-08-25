@@ -8,12 +8,10 @@
 use std::collections::VecDeque;
 
 use crate::core::TaskAssignmentIdIssuer;
-use crate::dispatch_queue::GlobalDispatchQueue;
+use crate::dispatch_queue::RgDispatchQueueWriter;
 use crate::error::MakeAssignmentError;
 use crate::job_registry::JobKey;
 use crate::job_registry::JobRegistry;
-use crate::resource_group::RgDispatchQueueEndpoints;
-use crate::resource_group::RgDispatchQueueWriter;
 use crate::types::FinalizeKind;
 use crate::types::JobId;
 use crate::types::ResourceGroupId;
@@ -52,10 +50,10 @@ impl RgSchedulingUnit {
     ///
     /// # Returns
     ///
-    /// A newly created, inactive unit publishing into `endpoints`.
+    /// A newly created, inactive unit publishing through `writer`.
     pub fn new(
         rg_id: ResourceGroupId,
-        endpoints: &RgDispatchQueueEndpoints,
+        writer: RgDispatchQueueWriter,
         active_job_list_capacity: usize,
     ) -> Self {
         Self {
@@ -67,7 +65,7 @@ impl RgSchedulingUnit {
             finalize_queue: VecDeque::new(),
             num_buffered_commits: 0,
             num_buffered_cleanups: 0,
-            writer: endpoints.writer(),
+            writer,
             downgrade_buffer: Vec::new(),
             active_job_list_capacity,
         }
@@ -157,7 +155,6 @@ impl RgSchedulingUnit {
         free: usize,
         session_id: SessionId,
         id_issuer: &TaskAssignmentIdIssuer,
-        global_queue: &GlobalDispatchQueue,
         job_registry: &mut JobRegistry,
         jobs_to_retire: &mut Vec<JobKey>,
     ) -> Result<(JobId, TaskId), MakeAssignmentError> {
@@ -173,7 +170,7 @@ impl RgSchedulingUnit {
         // rejected publication would be in neither place and could never be re-admitted.
         if let Some((job_id, kind)) = self.peek_finalization() {
             let task_id = TaskId::from(kind);
-            self.publish(job_id, task_id, session_id, id_issuer, global_queue)?;
+            self.publish(job_id, task_id, session_id, id_issuer)?;
             self.commit_finalization();
             return Ok((job_id, task_id));
         }
@@ -182,7 +179,7 @@ impl RgSchedulingUnit {
             .peek_regular_task(job_registry, jobs_to_retire)
             .ok_or(MakeAssignmentError::NoTask)?;
         let task_id = TaskId::Index(task_index);
-        self.publish(job_id, task_id, session_id, id_issuer, global_queue)?;
+        self.publish(job_id, task_id, session_id, id_issuer)?;
         Self::commit_regular_task(job_key, job_registry);
         Ok((job_id, task_id))
     }
@@ -357,22 +354,19 @@ impl RgSchedulingUnit {
         None
     }
 
-    /// Publishes one assignment into the group's dispatch queue and, when the group's coverage
-    /// requires it, a hint into the global dispatch queue.
+    /// Publishes one assignment for this group.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     ///
-    /// * [`MakeAssignmentError::DispatchQueueClosed`] if the group's queue is closed.
-    /// * [`MakeAssignmentError::BroadcastQueueClosed`] if the global dispatch queue is closed.
+    /// * Forwards [`RgDispatchQueueWriter::try_send`]'s return values on failure.
     fn publish(
         &self,
         job_id: JobId,
         task_id: TaskId,
         session_id: SessionId,
         id_issuer: &TaskAssignmentIdIssuer,
-        global_queue: &GlobalDispatchQueue,
     ) -> Result<(), MakeAssignmentError> {
         let assignment = TaskAssignment {
             id: id_issuer.next(),
@@ -381,24 +375,7 @@ impl RgSchedulingUnit {
             task_id,
             session_id,
         };
-        self.writer
-            .try_send(assignment)
-            .map_err(|_| MakeAssignmentError::DispatchQueueClosed)?;
-
-        // The assignment above must already be in the queue before the hint count is compared
-        // against the queue size: reversing the two lets a general execution manager consume a hint
-        // for an assignment that is not yet visible.
-        //
-        // `S` must likewise be sampled before `H`, per the memory-ordering argument in design §8.1.
-        let dispatch_queue_size = self.writer.queue_len();
-        if self.writer.living_hint() >= dispatch_queue_size {
-            return Ok(());
-        }
-
-        self.writer.increment_living_hint();
-        if !global_queue.try_send(self.writer.hint()) {
-            return Err(MakeAssignmentError::BroadcastQueueClosed);
-        }
+        self.writer.try_send(assignment)?;
         Ok(())
     }
 }

@@ -10,18 +10,17 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use std::time::Instant;
 
+use spider_core::session::SessionTracker;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::CoreConfig;
 use crate::core::Core;
 use crate::core::run_core_on_dedicated_thread;
+use crate::dispatch_queue::DispatchQueueRegistry;
 use crate::dispatch_queue::DispatchService;
-use crate::dispatch_queue::GlobalDispatchQueue;
 use crate::error::CoreError;
 use crate::error::HarnessError;
-use crate::resource_group::ResourceGroupTable;
-use crate::session::SessionManager;
 use crate::storage_client::SchedulerStorageClient;
 use crate::types::TaskAssignment;
 
@@ -117,9 +116,8 @@ impl Harness {
     ///
     /// * Forwards [`HarnessServer::start`]'s return values on failure.
     pub async fn start(config: HarnessConfig) -> Result<Self, HarnessError> {
-        let rg_table = ResourceGroupTable::new();
-        let global_queue = GlobalDispatchQueue::new();
-        let session_manager = SessionManager::default();
+        let session_tracker = SessionTracker::default();
+        let dispatch_queue_registry = DispatchQueueRegistry::new(session_tracker.clone());
         let storage = FakeStorage::new(config.storage);
         // No harness scenario replays a lost assignment, so the write side is dropped straight
         // away; the core reads the resulting closed queue exactly as it reads an empty one.
@@ -129,14 +127,13 @@ impl Harness {
         let core_thread = run_core_on_dedicated_thread(Core::new(
             config.core,
             storage.clone(),
-            rg_table.clone(),
-            global_queue.clone(),
-            session_manager.clone(),
+            dispatch_queue_registry.clone(),
+            session_tracker.clone(),
             reschedule_queue_reader,
             core_cancellation_token.clone(),
         ));
 
-        let dispatch_service = DispatchService::new(rg_table, global_queue, session_manager);
+        let dispatch_service = DispatchService::new(dispatch_queue_registry);
         let server = match HarnessServer::start(dispatch_service, storage.clone()).await {
             Ok(server) => server,
             Err(error) => {

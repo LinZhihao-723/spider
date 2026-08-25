@@ -22,7 +22,7 @@
 //!         │  assignments                 │  hints
 //!         ▼                              ▼
 //!   ┌───────────────────┐        ┌───────────────────┐
-//!   │  per-RG queues    │        │  global queue     │
+//!   │  per-RG queues    │        │  broadcast queue  │
 //!   └───────────────────┘        └───────────────────┘
 //!         │                              │
 //!         │  pinned                      │  general
@@ -43,8 +43,6 @@ pub mod dispatch_queue;
 pub mod error;
 pub mod harness;
 pub mod proto;
-pub mod resource_group;
-pub mod session;
 pub mod storage_client;
 pub mod types;
 
@@ -70,7 +68,6 @@ pub use crate::error::CoreError;
 pub use crate::error::HarnessError;
 pub use crate::error::MakeAssignmentError;
 pub use crate::error::StorageClientError;
-pub use crate::session::SessionManager;
 pub use crate::storage_client::SchedulerStorageClient;
 pub use crate::types::FinalizeKind;
 pub use crate::types::InboundEntry;

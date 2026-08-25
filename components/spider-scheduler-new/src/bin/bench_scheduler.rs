@@ -26,6 +26,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use clap::Parser;
+use spider_core::session::SessionTracker;
 use spider_scheduler_new::BenchCase;
 use spider_scheduler_new::CoreError;
 use spider_scheduler_new::HarnessError;
@@ -39,16 +40,14 @@ use spider_scheduler_new::bench::results::collect_job_records;
 use spider_scheduler_new::bench::results::host_num_cores;
 use spider_scheduler_new::core::Core;
 use spider_scheduler_new::core::run_core_on_dedicated_thread_with_tick_samples;
+use spider_scheduler_new::dispatch_queue::DispatchQueueRegistry;
 use spider_scheduler_new::dispatch_queue::DispatchService;
-use spider_scheduler_new::dispatch_queue::GlobalDispatchQueue;
 use spider_scheduler_new::harness::BenchInstrumentation;
 use spider_scheduler_new::harness::FakeStorage;
 use spider_scheduler_new::harness::FakeStorageConfig;
 use spider_scheduler_new::harness::FirstSeenRecorder;
 use spider_scheduler_new::harness::HarnessServer;
 use spider_scheduler_new::harness::ReleaseConfig;
-use spider_scheduler_new::resource_group::ResourceGroupTable;
-use spider_scheduler_new::session::SessionManager;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
@@ -164,20 +163,18 @@ async fn run(args: Args) -> Result<(), HarnessError> {
         job_progress,
     ));
 
-    let rg_table = ResourceGroupTable::new();
-    let global_queue = GlobalDispatchQueue::new();
-    let session_manager = SessionManager::default();
+    let session_tracker = SessionTracker::default();
+    let dispatch_queue_registry = DispatchQueueRegistry::new(session_tracker.clone());
     let core_cancellation_token = CancellationToken::new();
     let core_thread = spawn_core(
         &case,
         &storage,
-        &rg_table,
-        &global_queue,
-        &session_manager,
+        &dispatch_queue_registry,
+        &session_tracker,
         core_cancellation_token.clone(),
     );
 
-    let dispatch_service = DispatchService::new(rg_table, global_queue, session_manager);
+    let dispatch_service = DispatchService::new(dispatch_queue_registry);
     let server = match HarnessServer::start_bench(
         dispatch_service,
         storage.clone(),
@@ -277,9 +274,8 @@ fn build_storage(
 fn spawn_core(
     case: &BenchCase,
     storage: &FakeStorage,
-    rg_table: &ResourceGroupTable,
-    global_queue: &GlobalDispatchQueue,
-    session_manager: &SessionManager,
+    dispatch_queue_registry: &DispatchQueueRegistry,
+    session_tracker: &SessionTracker,
     cancellation_token: CancellationToken,
 ) -> JoinHandle<Result<Vec<TickSample>, CoreError>> {
     // The benchmark never replays a lost assignment, so the write side is dropped straight away;
@@ -290,9 +286,8 @@ fn spawn_core(
         Core::new(
             case.core_config(),
             storage.clone(),
-            rg_table.clone(),
-            global_queue.clone(),
-            session_manager.clone(),
+            dispatch_queue_registry.clone(),
+            session_tracker.clone(),
             reschedule_queue_reader,
             cancellation_token,
         )
