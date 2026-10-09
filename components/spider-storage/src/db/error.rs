@@ -4,6 +4,7 @@ use spider_core::job::JobState;
 use spider_core::types::id::ExecutionManagerId;
 use spider_core::types::id::JobId;
 use spider_core::types::id::ResourceGroupId;
+use spider_core::types::id::SessionId;
 
 #[derive(thiserror::Error, Debug)]
 pub enum DbError {
@@ -28,14 +29,14 @@ pub enum DbError {
     #[error("execution manager `{0:?}` is already dead")]
     ExecutionManagerAlreadyDead(ExecutionManagerId),
 
-    #[error("job in state {from} cannot transit into state {to}")]
-    InvalidJobStateTransition { from: JobState, to: JobState },
-
     #[error("job in state {current}, expect state {expected}")]
     UnexpectedJobState {
         current: JobState,
         expected: ExpectedStates,
     },
+
+    #[error("storage session {mine} is fenced off by the newer session {current}")]
+    Fenced { mine: SessionId, current: SessionId },
 
     #[error("database corrupted: {0}")]
     CorruptedDbState(String),
@@ -52,11 +53,41 @@ pub enum DbError {
     #[error("Value deserialization failure: {0}")]
     ValueDeserializationFailure(#[source] Box<dyn std::error::Error + Send + Sync>),
 
+    #[error("the database rejected a child insert's payload: {0}")]
+    PayloadRejected(#[source] sqlx::error::Error),
+
+    #[error("job outputs of {size} serialized bytes exceed the limit of {limit} bytes")]
+    OutputsTooLarge {
+        job_id: JobId,
+        size: u64,
+        limit: u64,
+    },
+
+    #[cfg(feature = "test-hooks")]
+    #[error("injected database failure (deterministic payload error: {deterministic_payload})")]
+    Injected { deterministic_payload: bool },
+
     #[error(transparent)]
     Sql(#[from] sqlx::error::Error),
 }
 
 impl DbError {
+    /// # Returns
+    ///
+    /// Whether the error is a payload rejection that the same statement would get again, such as
+    /// a packet or a value that is too large.
+    #[must_use]
+    pub const fn is_deterministic_payload_error(&self) -> bool {
+        match self {
+            Self::PayloadRejected(_) => true,
+            #[cfg(feature = "test-hooks")]
+            Self::Injected {
+                deterministic_payload,
+            } => *deterministic_payload,
+            _ => false,
+        }
+    }
+
     pub fn task_graph_ser<SerializationError: serde::ser::Error + Send + Sync + 'static>(
         e: SerializationError,
     ) -> Self {

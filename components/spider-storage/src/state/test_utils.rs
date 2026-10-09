@@ -1,5 +1,6 @@
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
@@ -15,10 +16,14 @@ use spider_core::types::id::TaskInstanceId;
 use spider_core::types::io::TaskOutput;
 use spider_core::types::resource_group::ExternalResourceGroupCredentials;
 use spider_core::types::scheduler::RegisteredScheduler;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use crate::cache::error::InternalError;
 use crate::cache::task::SharedTaskControlBlock;
 use crate::cache::task::SharedTerminationTaskControlBlock;
+use crate::cache::tree::TreeControlBlock;
 use crate::db::DbError;
 use crate::db::DbStorage;
 use crate::db::ExecutionManagerLivenessManagement;
@@ -28,10 +33,16 @@ use crate::db::RecoverableJobContext;
 use crate::db::ResourceGroupManagement;
 use crate::db::SchedulerRegistrationManagement;
 use crate::db::SessionManagement;
+use crate::db::TreeTransition;
 use crate::inbound_queue::InboundQueueSender;
 use crate::job_submission::ValidatedJobSubmission;
+use crate::state::JobCache;
+use crate::state::JobCacheGcHandle;
+use crate::state::ShutdownHandle;
+use crate::state::TreeEnv;
 use crate::task_instance_pool::TaskInstanceMetadata;
 use crate::task_instance_pool::TaskInstancePoolConnector;
+use crate::test_hooks::TestHooks;
 
 /// A mock inbound queue sender for testing.
 #[derive(Clone, Default)]
@@ -71,6 +82,8 @@ pub struct MockDbConnector {
     pub states: Arc<DashMap<JobId, JobState>>,
     pub errors: Arc<DashMap<JobId, String>>,
     pub outputs: Arc<DashMap<JobId, Vec<TaskOutput>>>,
+    pub parents: Arc<DashMap<JobId, JobId>>,
+    pub next_job_id: Arc<AtomicU64>,
     pub resource_groups: Arc<DashMap<ResourceGroupId, ExternalResourceGroupCredentials>>,
     pub resource_group_ids: Arc<DashMap<String, ResourceGroupId>>,
     pub next_resource_group_id: Arc<AtomicUsize>,
@@ -86,6 +99,8 @@ impl Default for MockDbConnector {
             states: Arc::new(DashMap::new()),
             errors: Arc::new(DashMap::new()),
             outputs: Arc::new(DashMap::new()),
+            parents: Arc::new(DashMap::new()),
+            next_job_id: Arc::new(AtomicU64::new(1)),
             resource_groups: Arc::new(DashMap::new()),
             resource_group_ids: Arc::new(DashMap::new()),
             next_resource_group_id: Arc::new(AtomicUsize::new(1)),
@@ -104,7 +119,7 @@ impl ExternalJobOrchestration for MockDbConnector {
         _resource_group_id: ResourceGroupId,
         _job_submission: &ValidatedJobSubmission,
     ) -> Result<JobId, DbError> {
-        let job_id = JobId::random();
+        let job_id = JobId::from(self.next_job_id.fetch_add(1, Ordering::Relaxed));
         self.states.insert(job_id, JobState::Ready);
         Ok(job_id)
     }
@@ -114,6 +129,14 @@ impl ExternalJobOrchestration for MockDbConnector {
             .get(&job_id)
             .map(|v| *v)
             .ok_or(DbError::JobNotFound(job_id))
+    }
+
+    async fn get_state_and_parent(
+        &self,
+        job_id: JobId,
+    ) -> Result<(JobState, Option<JobId>), DbError> {
+        let state = self.get_state(job_id).await?;
+        Ok((state, self.parents.get(&job_id).map(|v| *v)))
     }
 
     async fn get_outputs(&self, job_id: JobId) -> Result<Vec<TaskOutput>, DbError> {
@@ -133,34 +156,55 @@ impl ExternalJobOrchestration for MockDbConnector {
 
 #[async_trait::async_trait]
 impl InternalJobOrchestration for MockDbConnector {
-    async fn start(&self, job_id: JobId) -> Result<(), DbError> {
-        self.states.insert(job_id, JobState::Running);
-        Ok(())
-    }
-
-    async fn set_state(&self, job_id: JobId, state: JobState) -> Result<(), DbError> {
-        self.states.insert(job_id, state);
-        Ok(())
-    }
-
-    async fn commit_outputs(
+    async fn apply_tree_transition(
         &self,
-        job_id: JobId,
-        _job_outputs: Vec<TaskOutput>,
-        _has_commit_task: bool,
-    ) -> Result<(), DbError> {
-        self.states.insert(job_id, JobState::Succeeded);
-        Ok(())
+        transition: TreeTransition<'_>,
+    ) -> Result<Vec<JobId>, DbError> {
+        for update in &transition.updates {
+            let size: u64 = update
+                .outputs
+                .iter()
+                .flatten()
+                .map(|output| output.len() as u64)
+                .sum();
+            if size > MOCK_MAX_STATEMENT_PAYLOAD {
+                return Err(DbError::OutputsTooLarge {
+                    job_id: update.job_id,
+                    size,
+                    limit: MOCK_MAX_STATEMENT_PAYLOAD,
+                });
+            }
+        }
+        for update in &transition.updates {
+            let current = self.states.get(&update.job_id).map(|state| *state);
+            if current != Some(update.from) {
+                return Err(DbError::CorruptedDbState(format!(
+                    "expected job {:?} in state {}, found {current:?}",
+                    update.job_id, update.from
+                )));
+            }
+        }
+        for update in transition.updates {
+            self.states.insert(update.job_id, update.to);
+            if let Some(outputs) = update.outputs {
+                self.outputs.insert(update.job_id, outputs);
+            }
+            if let Some(error_message) = update.error_message {
+                self.errors.insert(update.job_id, error_message);
+            }
+        }
+        let mut child_ids = Vec::with_capacity(transition.child_inserts.len());
+        for insert in &transition.child_inserts {
+            let child_id = JobId::from(self.next_job_id.fetch_add(1, Ordering::Relaxed));
+            self.states.insert(child_id, JobState::Running);
+            self.parents.insert(child_id, insert.parent_id);
+            child_ids.push(child_id);
+        }
+        Ok(child_ids)
     }
 
-    async fn cancel(&self, job_id: JobId, _has_cleanup_task: bool) -> Result<(), DbError> {
-        self.states.insert(job_id, JobState::Cancelled);
-        Ok(())
-    }
-
-    async fn fail(&self, job_id: JobId, _error_message: String) -> Result<(), DbError> {
-        self.states.insert(job_id, JobState::Failed);
-        Ok(())
+    fn max_statement_payload(&self) -> u64 {
+        MOCK_MAX_STATEMENT_PAYLOAD
     }
 
     async fn delete_expired_terminated_jobs(
@@ -172,6 +216,16 @@ impl InternalJobOrchestration for MockDbConnector {
 
     async fn get_recoverable_jobs(&self) -> Result<Vec<RecoverableJobContext>, DbError> {
         Ok(Vec::new())
+    }
+
+    async fn has_failed_child(&self, parent_id: JobId) -> Result<bool, DbError> {
+        Ok(self.parents.iter().any(|entry| {
+            *entry.value() == parent_id
+                && self
+                    .states
+                    .get(entry.key())
+                    .is_some_and(|state| matches!(*state, JobState::Failed | JobState::Cancelled))
+        }))
     }
 }
 
@@ -361,3 +415,52 @@ impl TaskInstancePoolConnector for MockTaskInstancePoolConnector {
         Ok(())
     }
 }
+
+/// # Returns
+///
+/// The control block of a tree rooted at `root_id` that has no committer: every event submitted
+/// through it is answered as if the tree were closed.
+#[must_use]
+pub fn create_detached_tree(root_id: JobId) -> TreeControlBlock {
+    TreeControlBlock::new(root_id, CancellationToken::new(), TestHooks::default()).0
+}
+
+/// Creates a tree environment over `db` and `publisher`, with a fresh job cache, shutdown handle
+/// and task tracker.
+///
+/// # Returns
+///
+/// A pair, containing:
+///
+/// * The tree environment.
+/// * The receiver of the jobs that the environment enqueues for cache GC.
+#[must_use]
+pub fn create_test_tree_env<InboundQueueSenderType: InboundQueueSender>(
+    db: MockDbConnector,
+    publisher: InboundQueueSenderType,
+) -> (
+    TreeEnv<InboundQueueSenderType, MockDbConnector, MockTaskInstancePoolConnector>,
+    mpsc::UnboundedReceiver<JobId>,
+) {
+    let (gc_sender, gc_receiver) = mpsc::unbounded_channel();
+    let shutdown = ShutdownHandle::new(CancellationToken::new());
+    let tracker = TaskTracker::new();
+    let hooks = TestHooks::default();
+    hooks.register_runtime(shutdown.token(), &tracker);
+    (
+        TreeEnv {
+            db,
+            job_cache: JobCache::new(),
+            gc: JobCacheGcHandle::new(gc_sender),
+            publisher,
+            task_instance_pool: MockTaskInstancePoolConnector,
+            shutdown,
+            tracker,
+            hooks,
+        },
+        gc_receiver,
+    )
+}
+
+/// The statement payload bound of [`MockDbConnector`], the production upper bound.
+const MOCK_MAX_STATEMENT_PAYLOAD: u64 = 4 * 1024 * 1024;

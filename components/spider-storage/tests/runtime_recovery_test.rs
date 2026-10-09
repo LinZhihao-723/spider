@@ -234,7 +234,6 @@ async fn restart_after_starting_job(
 ) -> anyhow::Result<(
     JobId,
     Runtime<
-        spider_storage::inbound_queue::InboundQueueSenderHandle,
         spider_storage::db::MariaDbStorageConnector,
         spider_storage::task_instance_pool::TaskInstancePoolHandle,
     >,
@@ -273,7 +272,6 @@ async fn restart_after_commit_ready(
 ) -> anyhow::Result<(
     JobId,
     Runtime<
-        spider_storage::inbound_queue::InboundQueueSenderHandle,
         spider_storage::db::MariaDbStorageConnector,
         spider_storage::task_instance_pool::TaskInstancePoolHandle,
     >,
@@ -296,6 +294,7 @@ async fn restart_after_commit_ready(
             task_instance_id,
             inbound_entry.task_kind,
             serialized_single_output()?,
+            Vec::new(),
         )
         .await?;
     assert_eq!(state, JobState::CommitReady);
@@ -328,7 +327,6 @@ async fn restart_after_cleanup_ready(
 ) -> anyhow::Result<(
     JobId,
     Runtime<
-        spider_storage::inbound_queue::InboundQueueSenderHandle,
         spider_storage::db::MariaDbStorageConnector,
         spider_storage::task_instance_pool::TaskInstancePoolHandle,
     >,
@@ -357,11 +355,10 @@ async fn restart_after_cleanup_ready(
 /// * Forwards [`register_job`]'s return values on failure.
 /// * Forwards [`ServiceState::start_job`]'s return values on failure.
 async fn register_and_start_job<
-    InboundQueueSenderType: spider_storage::inbound_queue::InboundQueueSender,
     DbConnectorType: spider_storage::db::DbStorage,
     TaskInstancePoolConnectorType: spider_storage::task_instance_pool::TaskInstancePoolConnector,
 >(
-    service: &ServiceState<InboundQueueSenderType, DbConnectorType, TaskInstancePoolConnectorType>,
+    service: &ServiceState<DbConnectorType, TaskInstancePoolConnectorType>,
     with_commit: bool,
     with_cleanup: bool,
 ) -> anyhow::Result<JobId> {
@@ -384,11 +381,10 @@ async fn register_and_start_job<
 /// * Forwards [`spider_core::task::TaskGraph::to_json`]'s return values on failure.
 /// * Forwards [`ServiceState::register_job`]'s return values on failure.
 async fn register_job<
-    InboundQueueSenderType: spider_storage::inbound_queue::InboundQueueSender,
     DbConnectorType: spider_storage::db::DbStorage,
     TaskInstancePoolConnectorType: spider_storage::task_instance_pool::TaskInstancePoolConnector,
 >(
-    service: &ServiceState<InboundQueueSenderType, DbConnectorType, TaskInstancePoolConnectorType>,
+    service: &ServiceState<DbConnectorType, TaskInstancePoolConnectorType>,
     with_commit: bool,
     with_cleanup: bool,
 ) -> anyhow::Result<JobId> {
@@ -419,11 +415,10 @@ async fn register_job<
 /// * Forwards [`ServiceState::register_execution_manager`]'s return values on failure.
 /// * Forwards [`ServiceState::create_task_instance`]'s return values on failure.
 async fn run_recovered_regular_task<
-    InboundQueueSenderType: spider_storage::inbound_queue::InboundQueueSender,
     DbConnectorType: spider_storage::db::DbStorage,
     TaskInstancePoolConnectorType: spider_storage::task_instance_pool::TaskInstancePoolConnector,
 >(
-    service: &ServiceState<InboundQueueSenderType, DbConnectorType, TaskInstancePoolConnectorType>,
+    service: &ServiceState<DbConnectorType, TaskInstancePoolConnectorType>,
     job_id: JobId,
     task_index: TaskIndex,
 ) -> anyhow::Result<TaskInstanceId> {
@@ -458,11 +453,10 @@ async fn run_recovered_regular_task<
 /// * Forwards [`ServiceState::succeed_task_instance`]'s return values on failure.
 /// * Forwards [`TaskOutputsSerializer::deserialize`]'s return values on failure.
 async fn run_single_task_job_to_succeed<
-    InboundQueueSenderType: spider_storage::inbound_queue::InboundQueueSender,
     DbConnectorType: spider_storage::db::DbStorage,
     TaskInstancePoolConnectorType: spider_storage::task_instance_pool::TaskInstancePoolConnector,
 >(
-    service: &ServiceState<InboundQueueSenderType, DbConnectorType, TaskInstancePoolConnectorType>,
+    service: &ServiceState<DbConnectorType, TaskInstancePoolConnectorType>,
     job_id: JobId,
 ) -> anyhow::Result<Vec<TaskOutput>> {
     let inbound_entries = service.poll_ready_tasks(32, Duration::from_secs(1)).await?;
@@ -478,6 +472,7 @@ async fn run_single_task_job_to_succeed<
             task_instance_id,
             task_index,
             serialized_single_output()?,
+            Vec::new(),
         )
         .await?;
     assert_eq!(state, JobState::Succeeded);
@@ -495,11 +490,10 @@ async fn run_single_task_job_to_succeed<
 /// Panics if the registration succeeds or fails with an error other than
 /// [`StaleStateError::JobNoLongerRunning`].
 async fn assert_regular_task_registration_rejected<
-    InboundQueueSenderType: spider_storage::inbound_queue::InboundQueueSender,
     DbConnectorType: spider_storage::db::DbStorage,
     TaskInstancePoolConnectorType: spider_storage::task_instance_pool::TaskInstancePoolConnector,
 >(
-    service: &ServiceState<InboundQueueSenderType, DbConnectorType, TaskInstancePoolConnectorType>,
+    service: &ServiceState<DbConnectorType, TaskInstancePoolConnectorType>,
     job_id: JobId,
     execution_manager_id: ExecutionManagerId,
 ) {
@@ -532,11 +526,10 @@ async fn assert_regular_task_registration_rejected<
 /// * Forwards [`ServiceState::get_job_state`]'s return values.
 /// * Forwards [`ServiceState::get_job_outputs`]'s return values.
 async fn assert_job_outputs_on_success<
-    InboundQueueSenderType: spider_storage::inbound_queue::InboundQueueSender,
     DbConnectorType: spider_storage::db::DbStorage,
     TaskInstancePoolConnectorType: spider_storage::task_instance_pool::TaskInstancePoolConnector,
 >(
-    service: &ServiceState<InboundQueueSenderType, DbConnectorType, TaskInstancePoolConnectorType>,
+    service: &ServiceState<DbConnectorType, TaskInstancePoolConnectorType>,
     job_id: JobId,
     expected_outputs: &[TaskOutput],
 ) -> anyhow::Result<()> {

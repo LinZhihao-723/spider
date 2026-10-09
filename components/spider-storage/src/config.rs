@@ -44,6 +44,11 @@ pub struct DatabaseConfig {
     /// The maximum number of database connections maintained by the pool.
     pub max_connections: u32,
 
+    /// The ID of the `storage_fence` row that this storage service fences its writes with. Storage
+    /// services that share a database and a fence ID fence each other.
+    #[serde(skip)]
+    pub fence_id: u64,
+
     /// The credentials used to connect to the database.
     ///
     /// By default, Spider expects the database credentials to be supplied through the following

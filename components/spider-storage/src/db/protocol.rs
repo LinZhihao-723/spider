@@ -21,8 +21,68 @@ pub struct RecoverableJobContext {
     pub id: JobId,
     pub resource_group_id: ResourceGroupId,
     pub state: JobState,
+
+    /// The job's parent, or [`None`] for a root.
+    pub parent_id: Option<JobId>,
+
+    /// The root of the job's tree, or [`None`] for a root.
+    pub root_id: Option<JobId>,
+
     pub submission: ValidatedJobSubmission,
     pub outputs: Option<Vec<TaskOutput>>,
+}
+
+/// One guarded job state update of a tree transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobStateUpdate {
+    pub job_id: JobId,
+
+    /// The exact state the job's row must be in.
+    pub from: JobState,
+
+    pub to: JobState,
+
+    /// The job outputs to persist, if any.
+    pub outputs: Option<Vec<TaskOutput>>,
+
+    /// The error message to persist, if any.
+    pub error_message: Option<String>,
+}
+
+impl JobStateUpdate {
+    /// Factory function.
+    ///
+    /// # Returns
+    ///
+    /// An update of `job_id` from `from` to `to` that writes no outputs and no error message.
+    #[must_use]
+    pub const fn new(job_id: JobId, from: JobState, to: JobState) -> Self {
+        Self {
+            job_id,
+            from,
+            to,
+            outputs: None,
+            error_message: None,
+        }
+    }
+}
+
+/// One child job row to insert in a tree transition.
+pub struct ChildJobInsert<'buffer_lifetime> {
+    pub parent_id: JobId,
+    pub root_id: JobId,
+    pub resource_group_id: ResourceGroupId,
+    pub compressed_task_graph: &'buffer_lifetime [u8],
+    pub compressed_job_inputs: &'buffer_lifetime [u8],
+}
+
+/// The database part of one tree state transaction: every row it updates and every child row it
+/// inserts.
+pub struct TreeTransition<'buffer_lifetime> {
+    /// At most one update per job.
+    pub updates: Vec<JobStateUpdate>,
+
+    pub child_inserts: Vec<ChildJobInsert<'buffer_lifetime>>,
 }
 
 /// The database storage interface. A database storage must implement the following traits:
@@ -89,6 +149,31 @@ pub trait ExternalJobOrchestration {
     /// * Forwards [`sqlx::error::Error`] on DB operation failure.
     async fn get_state(&self, job_id: JobId) -> Result<JobState, DbError>;
 
+    /// Gets the state of a job and the ID of its parent job.
+    ///
+    /// # Parameters
+    ///
+    /// * `job_id` - The ID of the job.
+    ///
+    /// # Returns
+    ///
+    /// A tuple on success, containing:
+    ///
+    /// * The state of the job.
+    /// * The ID of the job's parent, or [`None`] if the job is a root.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    ///
+    /// * [`DbError::JobNotFound`] if the `job_id` does not exist.
+    /// * [`DbError::CorruptedDbState`] if the data in the DB is corrupted.
+    /// * Forwards [`sqlx::error::Error`] on DB operation failure.
+    async fn get_state_and_parent(
+        &self,
+        job_id: JobId,
+    ) -> Result<(JobState, Option<JobId>), DbError>;
+
     /// Gets the outputs of a job.
     ///
     /// # Parameters
@@ -134,109 +219,43 @@ pub trait ExternalJobOrchestration {
 /// Defines the internal storage interface for job storage in the database.
 #[async_trait]
 pub trait InternalJobOrchestration: Clone + Send + Sync {
-    /// Starts a job.
+    /// Writes one tree transition in a single fenced database transaction.
+    ///
+    /// Every update is guarded by its exact `from` state, and every child is inserted as
+    /// [`JobState::Running`]. Nothing is written unless every update matches its row.
     ///
     /// # Parameters
     ///
-    /// * `job_id` - The ID of the job.
+    /// * `transition` - The updates and the child inserts to write.
+    ///
+    /// # Returns
+    ///
+    /// The IDs of the inserted child jobs, in the order of `transition.child_inserts`, on success.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     ///
-    /// * [`DbError::JobNotFound`] if the `job_id` does not exist.
-    /// * [`DbError::UnexpectedJobState`] if the job is not in [`JobState::Ready`] state.
-    /// * [`DbError::CorruptedDbState`] if the data in the DB is corrupted.
+    /// * [`DbError::Fenced`] if a newer storage session has fenced this one off.
+    /// * [`DbError::CorruptedDbState`] if:
+    ///   * An update's row is missing or not in its `from` state.
+    ///   * The database returns a different number of child IDs than it was asked to insert.
+    /// * [`DbError::PayloadRejected`] if the database rejects a child insert's payload as too
+    ///   large.
+    /// * [`DbError::OutputsTooLarge`] if an update's serialized outputs are too large for one
+    ///   statement. Nothing is sent to the database then.
+    /// * [`DbError::ValueSerializationFailure`] if outputs fail to serialize.
     /// * Forwards [`sqlx::error::Error`] on DB operation failure.
-    async fn start(&self, job_id: JobId) -> Result<(), DbError>;
-
-    /// Sets the state of a job.
-    ///
-    /// # Parameters
-    ///
-    /// * `job_id` - The ID of the job.
-    /// * `state` - The new state to set for the job.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    ///
-    /// * [`DbError::JobNotFound`] if the `job_id` does not exist.
-    /// * [`DbError::InvalidJobStateTransition`] if transition from current state to `state` is
-    ///   invalid.
-    /// * [`DbError::CorruptedDbState`] if the data in the DB is corrupted.
-    /// * Forwards [`sqlx::error::Error`] on DB operation failure.
-    async fn set_state(&self, job_id: JobId, state: JobState) -> Result<(), DbError>;
-
-    /// Commits the job outputs.
-    ///
-    /// A job is ready to commit if all its tasks have been completed successfully. The job outputs
-    /// will be persisted in the database. The job enters the state:
-    ///
-    /// * [`JobState::CommitReady`] if the job has a commit task.
-    /// * [`JobState::Succeeded`] otherwise.
-    ///
-    /// # Parameters
-    ///
-    /// * `job_id` - The ID of the job.
-    /// * `job_outputs` - The outputs of the job.
-    /// * `has_commit_task` - Whether the job has commit task.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    ///
-    /// * [`DbError::JobNotFound`] if the `job_id` does not exist.
-    /// * [`DbError::InvalidJobStateTransition`] if the current job state is not
-    ///   [`JobState::Running`].
-    /// * [`DbError::ValueSerializationFailure`] if the `job_outputs` serialization fails.
-    /// * [`DbError::CorruptedDbState`] if the data in the DB is corrupted.
-    /// * Forwards [`sqlx::error::Error`] on DB operation failure.
-    async fn commit_outputs(
+    async fn apply_tree_transition(
         &self,
-        job_id: JobId,
-        job_outputs: Vec<TaskOutput>,
-        has_commit_task: bool,
-    ) -> Result<(), DbError>;
+        transition: TreeTransition<'_>,
+    ) -> Result<Vec<JobId>, DbError>;
 
-    /// Cancels the job.
+    /// # Returns
     ///
-    /// The job enters the state:
-    ///
-    /// * [`JobState::CleanupReady`] if the job has a cleanup task.
-    /// * [`JobState::Cancelled`] otherwise.
-    ///
-    /// # Parameters
-    ///
-    /// * `job_id` - The ID of the job.
-    /// * `has_cleanup_task` - Whether the job has cleanup task.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    ///
-    /// * [`DbError::JobNotFound`] if the `job_id` does not exist.
-    /// * [`DbError::InvalidJobStateTransition`] if the job is not in a cancellable state.
-    /// * [`DbError::CorruptedDbState`] if the data in the DB is corrupted.
-    /// * Forwards [`sqlx::error::Error`] on DB operation failure.
-    async fn cancel(&self, job_id: JobId, has_cleanup_task: bool) -> Result<(), DbError>;
-
-    /// Fails job execution.
-    ///
-    /// # Parameters
-    ///
-    /// * `job_id` - The ID of the job.
-    /// * `error_message` - The error message explaining the failure.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    ///
-    /// * [`DbError::JobNotFound`] if the `job_id` does not exist.
-    /// * [`DbError::InvalidJobStateTransition`] if the job is already in a terminal state.
-    /// * [`DbError::CorruptedDbState`] if the data in the DB is corrupted.
-    /// * Forwards [`sqlx::error::Error`] on DB operation failure.
-    async fn fail(&self, job_id: JobId, error_message: String) -> Result<(), DbError>;
+    /// The maximum number of payload bytes that one statement of [`Self::apply_tree_transition`]
+    /// binds, which also bounds the compressed size of one child job.
+    fn max_statement_payload(&self) -> u64;
 
     /// Deletes all expired terminated jobs.
     ///
@@ -265,7 +284,8 @@ pub trait InternalJobOrchestration: Clone + Send + Sync {
     /// # Returns
     ///
     /// All persisted jobs in [`JobState::Ready`], [`JobState::Running`],
-    /// [`JobState::CommitReady`], or [`JobState::CleanupReady`] on success.
+    /// [`JobState::BlockingOnChildren`], [`JobState::CommitReady`], or [`JobState::CleanupReady`],
+    /// with their parent and root IDs, on success.
     ///
     /// # Errors
     ///
@@ -275,6 +295,23 @@ pub trait InternalJobOrchestration: Clone + Send + Sync {
     /// * [`DbError::ValueDeserializationFailure`] if persisted inputs or outputs are invalid.
     /// * Forwards [`sqlx::error::Error`] on DB operation failure.
     async fn get_recoverable_jobs(&self) -> Result<Vec<RecoverableJobContext>, DbError>;
+
+    /// Checks whether a job has a child in [`JobState::Failed`] or [`JobState::Cancelled`].
+    ///
+    /// # Parameters
+    ///
+    /// * `parent_id` - The ID of the parent job.
+    ///
+    /// # Returns
+    ///
+    /// Whether such a child exists on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    ///
+    /// * Forwards [`sqlx::error::Error`] on DB operation failure.
+    async fn has_failed_child(&self, parent_id: JobId) -> Result<bool, DbError>;
 }
 
 /// Defines the storage interface for resource group management in the database.

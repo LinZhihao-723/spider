@@ -4,6 +4,7 @@ use spider_core::types::id::JobId;
 use spider_utils::wire::WireError;
 
 use crate::db::DbError;
+use crate::job_submission::JobSubmissionError;
 
 /// Enums for all possible errors that can occur in a cache operation.
 #[derive(thiserror::Error, Debug)]
@@ -13,6 +14,9 @@ pub enum CacheError {
 
     #[error(transparent)]
     StaleState(#[from] StaleStateError),
+
+    #[error("storage service is shutting down")]
+    ServiceStopping,
 }
 
 impl From<DbError> for CacheError {
@@ -73,8 +77,22 @@ pub enum InternalError {
     #[error("job has no cleanup task")]
     UndefinedCleanupTask,
 
-    #[error("job terminated unexpectedly")]
-    UnexpectedJobTermination,
+    #[error("job {job_id:?} is cached as {actual}, but a committed transition expects {expected}")]
+    CacheDbDivergence {
+        job_id: JobId,
+        expected: JobState,
+        actual: JobState,
+    },
+
+    #[error("job tree poisoned: its committer exited abnormally")]
+    TreePoisoned,
+
+    #[error("spawned handler body failed: {0}")]
+    HandlerBodyFailed(String),
+
+    #[cfg(feature = "test-hooks")]
+    #[error("injected fault: {0}")]
+    InjectedFault(String),
 
     #[error("task instance pool corrupted: {0}")]
     TaskInstancePoolCorrupted(String),
@@ -102,6 +120,19 @@ pub enum InternalError {
 
     #[error(transparent)]
     Db(#[from] crate::db::DbError),
+}
+
+/// Enums for the reasons why a child job of a task's success report cannot be prepared.
+#[derive(thiserror::Error, Debug)]
+pub enum ChildPreparationError {
+    #[error(transparent)]
+    Submission(#[from] JobSubmissionError),
+
+    #[error("failed to build the child's task graph: {0}")]
+    TaskGraph(#[from] InternalError),
+
+    #[error("the child's task graph has no ready task")]
+    NoReadyTask,
 }
 
 /// Enums for all errors representing operations that are rejected due to stale cache state.
@@ -143,4 +174,7 @@ pub enum StaleStateError {
 
     #[error("job already started")]
     JobAlreadyStarted,
+
+    #[error("job in state {0:?} has not succeeded")]
+    JobNotSucceeded(JobState),
 }

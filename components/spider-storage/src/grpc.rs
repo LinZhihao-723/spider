@@ -14,7 +14,6 @@ use spider_proto_rust::storage::SessionManagementService;
 use spider_proto_rust::storage::TaskInstanceManagementService;
 use spider_proto_rust::storage::{self};
 use spider_proto_rust::unpack::RequestUnpack;
-use tokio_util::sync::CancellationToken;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
@@ -23,7 +22,7 @@ use crate::cache::error::CacheError;
 use crate::db::DbError;
 use crate::db::DbStorage;
 use crate::inbound_queue::InboundQueueEntry;
-use crate::inbound_queue::InboundQueueSender;
+use crate::job_submission::ChildJobSubmission;
 use crate::state::ServiceState;
 use crate::state::StorageServerError;
 use crate::task_instance_pool::TaskInstancePoolConnector;
@@ -32,24 +31,20 @@ use crate::task_instance_pool::TaskInstancePoolConnector;
 ///
 /// # Type Parameters
 ///
-/// * `InboundQueueSenderType` - The inbound queue sender type.
 /// * `DbConnectorType` - The database connector type.
 /// * `TaskInstancePoolConnectorType` - The task instance pool connector type.
 #[derive(Clone)]
 pub struct GrpcServiceState<
-    InboundQueueSenderType: InboundQueueSender + 'static,
     DbConnectorType: DbStorage + 'static,
     TaskInstancePoolConnectorType: TaskInstancePoolConnector + 'static,
 > {
-    inner: ServiceState<InboundQueueSenderType, DbConnectorType, TaskInstancePoolConnectorType>,
-    cancellation_token: CancellationToken,
+    inner: ServiceState<DbConnectorType, TaskInstancePoolConnectorType>,
 }
 
 impl<
-    InboundQueueSenderType: InboundQueueSender + 'static,
     DbConnectorType: DbStorage + 'static,
     TaskInstancePoolConnectorType: TaskInstancePoolConnector + 'static,
-> GrpcServiceState<InboundQueueSenderType, DbConnectorType, TaskInstancePoolConnectorType>
+> GrpcServiceState<DbConnectorType, TaskInstancePoolConnectorType>
 {
     /// Factory function.
     ///
@@ -57,14 +52,8 @@ impl<
     ///
     /// A new [`GrpcServiceState`] wrapping [`ServiceState`].
     #[must_use]
-    pub const fn new(
-        inner: ServiceState<InboundQueueSenderType, DbConnectorType, TaskInstancePoolConnectorType>,
-        cancellation_token: CancellationToken,
-    ) -> Self {
-        Self {
-            inner,
-            cancellation_token,
-        }
+    pub const fn new(inner: ServiceState<DbConnectorType, TaskInstancePoolConnectorType>) -> Self {
+        Self { inner }
     }
 
     /// Error handler for job orchestration service errors.
@@ -76,6 +65,7 @@ impl<
     ///
     /// The [`Status`] to send to the client:
     ///
+    /// * `UNAVAILABLE` if the service is shutting down.
     /// * `INTERNAL` for:
     ///   * A fatal cache-internal error (the service will restart).
     ///   * Any other (database or otherwise unexpected) error.
@@ -113,9 +103,7 @@ impl<
                 Status::not_found("job not found")
             }
 
-            error @ StorageServerError::Db(
-                DbError::InvalidJobStateTransition { .. } | DbError::UnexpectedJobState { .. },
-            ) => {
+            error @ StorageServerError::Db(DbError::UnexpectedJobState { .. }) => {
                 tracing::warn!(
                     error = % error,
                     service = SERVICE_NAME,
@@ -168,6 +156,7 @@ impl<
     ///
     /// The [`Status`] to send to the client:
     ///
+    /// * `UNAVAILABLE` if the service is shutting down.
     /// * `INTERNAL` for:
     ///   * A fatal cache-internal error (the service will restart).
     ///   * Any other unexpected error (the service will restart).
@@ -237,6 +226,7 @@ impl<
     ///
     /// The [`Status`] to send to the client:
     ///
+    /// * `UNAVAILABLE` if the service is shutting down.
     /// * `INTERNAL` for any failure happened on the server side. This method should never fail
     ///   under the service's assumption.
     #[must_use]
@@ -259,6 +249,7 @@ impl<
     ///
     /// The [`Status`] to send to the client:
     ///
+    /// * `UNAVAILABLE` if the service is shutting down.
     /// * `UNAUTHENTICATED` for an unknown or unauthorized resource group.
     /// * `ALREADY_EXISTS` for a duplicate external resource group ID.
     /// * `INTERNAL` for:
@@ -306,6 +297,7 @@ impl<
     ///
     /// The [`Status`] to send to the client:
     ///
+    /// * `UNAVAILABLE` if the service is shutting down.
     /// * `UNAUTHENTICATED` for an unknown resource group or an invalid password.
     /// * `FAILED_PRECONDITION` when the execution manager has already been reaped.
     /// * `INVALID_ARGUMENT` for an illegal execution manager ID.
@@ -364,6 +356,7 @@ impl<
     ///
     /// The [`Status`] to send to the client:
     ///
+    /// * `UNAVAILABLE` if the service is shutting down.
     /// * `INTERNAL` for any failure happened on the server side.
     #[must_use]
     #[allow(clippy::needless_pass_by_value)]
@@ -378,20 +371,25 @@ impl<
 
     /// Handles generic storage server errors.
     ///
-    /// This handler maps every [`StorageServerError`] to an `INTERNAL` [`Status`] with a generic
-    /// error message. Errors are treated as fatal, and the storage service is cancelled in any of
-    /// the following cases:
+    /// This handler maps [`StorageServerError::Stopping`] to an `UNAVAILABLE` [`Status`], and every
+    /// other [`StorageServerError`] to an `INTERNAL` [`Status`] with a generic error message.
+    /// Errors are treated as fatal, and the storage service is shut down fatally in any of the
+    /// following cases:
     ///
     /// * The error is [`CacheError::Internal`].
     /// * The error is [`DbError::CorruptedDbState`].
-    /// * `strict_mode` is enabled.
+    /// * The error is [`DbError::Fenced`].
+    /// * `strict_mode` is enabled and the error is not [`StorageServerError::Stopping`].
     ///
     /// Non-fatal errors are logged as warnings. Fatal errors are logged as errors before
     /// cancellation.
     ///
     /// # Returns
     ///
-    /// An `INTERNAL` [`Status`] with a generic storage service error message.
+    /// The [`Status`] to send to the client:
+    ///
+    /// * `UNAVAILABLE` if the service is shutting down.
+    /// * `INTERNAL` with a generic storage service error message, otherwise.
     #[must_use]
     fn default_error_handler(
         &self,
@@ -401,6 +399,16 @@ impl<
         strict_mode: bool,
     ) -> Status {
         match error {
+            StorageServerError::Stopping(e) => {
+                tracing::warn!(
+                    error = % e,
+                    service,
+                    tag,
+                    "The service is shutting down."
+                );
+                return Status::unavailable("storage service is shutting down");
+            }
+
             StorageServerError::Cache(CacheError::Internal(e)) => {
                 tracing::error!(
                     error = % e,
@@ -408,7 +416,7 @@ impl<
                     tag,
                     "Internal error in the cache layer. Cancelling service."
                 );
-                self.cancellation_token.cancel();
+                self.inner.shutdown().shut_down_fatally();
             }
 
             StorageServerError::Db(DbError::CorruptedDbState(e)) => {
@@ -418,7 +426,17 @@ impl<
                     tag,
                     "Internal error in the database layer. Cancelling service."
                 );
-                self.cancellation_token.cancel();
+                self.inner.shutdown().shut_down_fatally();
+            }
+
+            StorageServerError::Db(e @ DbError::Fenced { .. }) => {
+                tracing::error!(
+                    error = % e,
+                    service,
+                    tag,
+                    "The storage session is fenced off by a newer session. Cancelling service."
+                );
+                self.inner.shutdown().shut_down_fatally();
             }
 
             e => {
@@ -429,7 +447,7 @@ impl<
                         tag,
                         "Unexpected internal error. Cancelling service."
                     );
-                    self.cancellation_token.cancel();
+                    self.inner.shutdown().shut_down_fatally();
                 } else {
                     tracing::warn!(
                         error = % e,
@@ -487,11 +505,9 @@ impl<
 /// [`GrpcServiceState::job_orchestration_service_error_handler`].
 #[async_trait]
 impl<
-    InboundQueueSenderType: InboundQueueSender + 'static,
     DbConnectorType: DbStorage + 'static,
     TaskInstancePoolConnectorType: TaskInstancePoolConnector + 'static,
-> JobOrchestrationService
-    for GrpcServiceState<InboundQueueSenderType, DbConnectorType, TaskInstancePoolConnectorType>
+> JobOrchestrationService for GrpcServiceState<DbConnectorType, TaskInstancePoolConnectorType>
 {
     async fn register_job(
         &self,
@@ -594,11 +610,10 @@ impl<
 
 #[async_trait]
 impl<
-    InboundQueueSenderType: InboundQueueSender + 'static,
     DbConnectorType: DbStorage + 'static,
     TaskInstancePoolConnectorType: TaskInstancePoolConnector + 'static,
 > TaskInstanceManagementService
-    for GrpcServiceState<InboundQueueSenderType, DbConnectorType, TaskInstancePoolConnectorType>
+    for GrpcServiceState<DbConnectorType, TaskInstancePoolConnectorType>
 {
     async fn register_task_instance(
         &self,
@@ -641,7 +656,7 @@ impl<
         &self,
         request: Request<storage::ReportTaskSuccessRequest>,
     ) -> Result<Response<common::Void>, Status> {
-        let (session_id, job_id, task_id, task_instance_id, serialized_outputs) =
+        let (session_id, job_id, task_id, task_instance_id, serialized_outputs, children) =
             request.into_inner().unpack()?;
         tracing::info!(
             session_id = session_id,
@@ -651,6 +666,11 @@ impl<
             "Task instance completion request (success) received."
         );
 
+        if !children.is_empty() && !matches!(task_id, TaskId::Index(_)) {
+            return Err(Status::invalid_argument(
+                "children are only accepted from regular tasks",
+            ));
+        }
         let _job_state = match task_id {
             TaskId::Index(task_index) => {
                 self.inner
@@ -660,6 +680,15 @@ impl<
                         task_instance_id,
                         task_index,
                         serialized_outputs,
+                        children
+                            .into_iter()
+                            .map(|child| ChildJobSubmission {
+                                compressed_serialized_task_graph: child
+                                    .compressed_serialized_task_graph,
+                                compressed_serialized_job_inputs: child
+                                    .compressed_serialized_task_graph_input,
+                            })
+                            .collect(),
                     )
                     .await
             }
@@ -708,11 +737,9 @@ impl<
 
 #[async_trait]
 impl<
-    InboundQueueSenderType: InboundQueueSender + 'static,
     DbConnectorType: DbStorage + 'static,
     TaskInstancePoolConnectorType: TaskInstancePoolConnector + 'static,
-> InboundQueueService
-    for GrpcServiceState<InboundQueueSenderType, DbConnectorType, TaskInstancePoolConnectorType>
+> InboundQueueService for GrpcServiceState<DbConnectorType, TaskInstancePoolConnectorType>
 {
     async fn poll_ready_tasks(
         &self,
@@ -771,11 +798,10 @@ impl<
 
 #[async_trait]
 impl<
-    InboundQueueSenderType: InboundQueueSender + 'static,
     DbConnectorType: DbStorage + 'static,
     TaskInstancePoolConnectorType: TaskInstancePoolConnector + 'static,
 > ResourceGroupManagementService
-    for GrpcServiceState<InboundQueueSenderType, DbConnectorType, TaskInstancePoolConnectorType>
+    for GrpcServiceState<DbConnectorType, TaskInstancePoolConnectorType>
 {
     async fn add_resource_group(
         &self,
@@ -843,11 +869,10 @@ impl<
 
 #[async_trait]
 impl<
-    InboundQueueSenderType: InboundQueueSender + 'static,
     DbConnectorType: DbStorage + 'static,
     TaskInstancePoolConnectorType: TaskInstancePoolConnector + 'static,
 > ExecutionManagerLivenessService
-    for GrpcServiceState<InboundQueueSenderType, DbConnectorType, TaskInstancePoolConnectorType>
+    for GrpcServiceState<DbConnectorType, TaskInstancePoolConnectorType>
 {
     async fn register_execution_manager(
         &self,
@@ -903,11 +928,10 @@ impl<
 
 #[async_trait]
 impl<
-    InboundQueueSenderType: InboundQueueSender + 'static,
     DbConnectorType: DbStorage + 'static,
     TaskInstancePoolConnectorType: TaskInstancePoolConnector + 'static,
 > SchedulerRegistrationService
-    for GrpcServiceState<InboundQueueSenderType, DbConnectorType, TaskInstancePoolConnectorType>
+    for GrpcServiceState<DbConnectorType, TaskInstancePoolConnectorType>
 {
     async fn register_scheduler(
         &self,
@@ -940,11 +964,9 @@ impl<
 
 #[async_trait]
 impl<
-    InboundQueueSenderType: InboundQueueSender + 'static,
     DbConnectorType: DbStorage + 'static,
     TaskInstancePoolConnectorType: TaskInstancePoolConnector + 'static,
-> SessionManagementService
-    for GrpcServiceState<InboundQueueSenderType, DbConnectorType, TaskInstancePoolConnectorType>
+> SessionManagementService for GrpcServiceState<DbConnectorType, TaskInstancePoolConnectorType>
 {
     async fn get_session(
         &self,
@@ -965,4 +987,69 @@ fn make_job_state_response(
     Response::new(storage::JobStateResponse {
         state: storage::JobState::from(state).into(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use spider_core::types::id::TaskId;
+    use spider_core::types::io::TaskOutputsSerializer;
+    use spider_proto_rust::common;
+    use spider_proto_rust::storage::TaskInstanceManagementService;
+    use spider_proto_rust::storage::{self};
+    use tokio_util::sync::CancellationToken;
+    use tonic::Request;
+
+    use super::GrpcServiceState;
+    use crate::inbound_queue::InboundQueueConfig;
+    use crate::inbound_queue::create_inbound_queue;
+    use crate::state::JobCache;
+    use crate::state::JobCacheGcHandle;
+    use crate::state::ServiceState;
+    use crate::state::ServiceStateParams;
+    use crate::state::ShutdownHandle;
+    use crate::state::test_utils::MockDbConnector;
+    use crate::state::test_utils::MockInboundQueueSender;
+    use crate::state::test_utils::MockTaskInstancePoolConnector;
+    use crate::test_hooks::TestHooks;
+
+    #[tokio::test]
+    async fn report_task_success_accepts_children_only_from_regular_tasks() {
+        let (_sender, inbound_queue_receiver) =
+            create_inbound_queue(&InboundQueueConfig::default()).expect("inbound queue creation");
+        let grpc_service = GrpcServiceState::new(ServiceState::new(ServiceStateParams {
+            db: MockDbConnector::default(),
+            session_id: 0,
+            job_cache: JobCache::new(),
+            inbound_queue_sender: MockInboundQueueSender,
+            inbound_queue_receiver,
+            task_instance_pool_connector: MockTaskInstancePoolConnector,
+            job_cache_gc_handle: JobCacheGcHandle::new(tokio::sync::mpsc::unbounded_channel().0),
+            shutdown: ShutdownHandle::new(CancellationToken::new()),
+            hooks: TestHooks::default(),
+        }));
+        let serialized_outputs = TaskOutputsSerializer::from_tuple(&(vec![1u8],))
+            .expect("output serialization should succeed");
+
+        let mut codes = Vec::new();
+        for task_id in [TaskId::Index(0), TaskId::Commit, TaskId::Cleanup] {
+            let result = grpc_service
+                .report_task_success(Request::new(storage::ReportTaskSuccessRequest {
+                    task_id: Some(common::TaskId::from(task_id)),
+                    serialized_outputs: serialized_outputs.clone(),
+                    children: vec![storage::ChildJobRequest::default()],
+                    ..Default::default()
+                }))
+                .await;
+            codes.push(result.err().map(|status| status.code()));
+        }
+
+        assert_eq!(
+            codes,
+            vec![
+                Some(tonic::Code::FailedPrecondition),
+                Some(tonic::Code::InvalidArgument),
+                Some(tonic::Code::InvalidArgument),
+            ]
+        );
+    }
 }

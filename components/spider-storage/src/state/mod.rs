@@ -1,18 +1,26 @@
 pub mod error;
 pub mod job_cache;
 pub mod job_cache_gc;
+pub mod publisher;
 pub mod runtime;
 pub mod service;
+pub mod shutdown;
+pub mod tree_committer;
 
 pub use error::StorageServerError;
 pub use job_cache::JobCache;
 pub use job_cache_gc::JobCacheGcConfig;
 pub use job_cache_gc::JobCacheGcHandle;
 pub use job_cache_gc::create_job_cache_gc;
+pub use publisher::StagingPublisher;
 pub use runtime::Runtime;
 pub use runtime::create_runtime;
+pub use runtime::create_runtime_with_hooks;
 pub use service::ServiceState;
 pub use service::ServiceStateParams;
+pub use shutdown::ShutdownHandle;
+pub use tree_committer::TreeEnv;
+pub use tree_committer::create_root_tree;
 
 #[cfg(test)]
-mod test_utils;
+pub(crate) mod test_utils;
